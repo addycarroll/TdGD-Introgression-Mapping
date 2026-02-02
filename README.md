@@ -71,3 +71,31 @@
 - OUTPUT: A CSI index file generated for the BAM file stored in the output directory
 - Uses SAMtools for indexing the BAM file via samtools index -c
 ***
+## Variant calling and filtering
+**10a. VariantCall.sh:** Call variants by chromosome, per subgenome
+- INPUT:
+  - File with a list of full paths to BAM files
+  - Reference genome FASTA
+- OUTPUT: A VCF file per chromosome and subgenome
+- PARAMETER MODIFICATION: Modify the BAM depth threshold as desired
+- Uses BCFtools mpileup for variant calling
+
+**10b. vcf_arrayConcordance.sh:** Call variants by chromosome, per subgenome, at targeted sites based off progeny array data
+- INPUT: 
+  - File with a list of full paths to BAM files
+  - List of target positions
+  - Reference genome FASTA
+- OUTPUT: A VCF file across all target array sites
+- PARAMETER MODIFICATION: Modify the BAM depth threshold as desired
+- Uses BCFtools to call variants with mpileup at targeted sites
+***
+
+
+
+
+
+
+
+
+
+
