@@ -89,8 +89,21 @@
 - PARAMETER MODIFICATION: Modify the BAM depth threshold as desired
 - Uses BCFtools to call variants with mpileup at targeted sites
 ***
-
-
+**11. 10DP60_SiteFilter.sh:** Apply site-level DP based filtering to VCFs
+- INPUT: A list of VCF file paths
+- OUTPUT: For each input VCF, a filtered output VCF and CSI index containing only biallelic SNPs where INFO/DP is between 10 and 60
+- Uses BCFtools to filter on INFO/DP, restrict to SNPs, and retain only biallelic sites (-m2 -M2)
+*** 
+**12. QUAL_MISS_SiteFilter.sh:** Apply QUAL and missingness filtering to VCFs by chromosome
+- INPUT: A set of chromosome-specific VCFs already filtered for site-level DP (10-60)
+- OUTPUT: For each input VCF, a compressed and indexed VCF containing only sites that pass both QUAL and missingness filters
+- PARAMETER MODIFICATION:
+  - QUAL threshold (QUAL >= 30)
+  - Missingness thresholds, varying by genome
+      - For A/B genomes: retain sites with at least 4 of 9 samples called (~<= 55.5% missingness)
+      - For D genome: retain sites with at least 2 of 4 samples called (<= 50% missingness)
+- Uses BCFtools view to apply site level QUAL and F_MISSING filters and index to a csi file
+***
 
 
 
