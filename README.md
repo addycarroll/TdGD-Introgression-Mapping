@@ -104,6 +104,14 @@
       - For D genome: retain sites with at least 2 of 4 samples called (<= 50% missingness)
 - Uses BCFtools view to apply site level QUAL and F_MISSING filters and index to a csi file
 ***
+**13. extract_GT.sh:** Convert filtered VCFs into per-chromosome genotype matrices
+- INPUT:
+  - Text file listing the full paths to filtered VCFs
+  - Per-chromosome filtered VCFs, compressed and indexed
+- OUTPUT: Per-chromosome .tsv files with columns Marker (ChrPos), REF, ALT, followed by all sample columns, with genotype calls for each marker
+- Uses BCFtools query to get sample IDs and construct the matrix header, and extract POS, REF, ALT, and TGT fields, followed by an awk command to append chromosome prefix to marker positions
+***
+
 
 
 
