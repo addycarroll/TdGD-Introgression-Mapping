@@ -150,3 +150,9 @@
 ***
 ## Prepare input files for AlphaImpute2
 **16. merge_markers_by_chr_by_pop.Rmd:** Merge array- and sequence-based genotype matrices by chromosome
+** 16.1:**
+- INPUT:
+  - Per-population array hapmap files
+  - Per-population, per-chromosome thinned parent genotype matrices
+- OUTPUT:
+  - Merged matrices by 
