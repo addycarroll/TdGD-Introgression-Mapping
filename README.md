@@ -215,4 +215,20 @@
 - PARAMETER MODIFICATION: Update parent mapping manifest as needed
 - Arrays over all per-population per-chromosome files, standardized sample naming to be consistent with input pedigree file, convert to numeric format and transpose
 ***
-
+## Perform pedigree-based imputation using AlphaImpute2
+**18. AlphImp_perPopulation_runPedOnly.sh:** Run AlphaImpute2 in pedigree-only mode per-population per-chromosome and compute donor allele proportions
+- INPUT:
+  - AlphaImpute2 .genotypes files generated in step 17
+  - Population specific pedigree files
+  - Embedded parent mapping table defining RP and DONOR identites by population and subgenome
+- OUTPUT:
+  - Imputed .genotypes files
+  - Donor proportion tables broken down by WIL, population, chromosome, subgenome, with number of informative markers, number of nonmissing markers used, and the donor proportion calculation
+- PARAMETER MODIFICATION: update parent mapping table and AI2 run specifications (error, length, fpeel, etc.) as needed
+- Arrays over all per-population and per-chromosome input genotype files:
+  - Runs AlphaImpute2 algorithm for imputation
+  - Identify informative markers using the parents and for each marker, record whether donor corresponds to 0 or 2
+  - Compute per-individual donor contribution for each marker and divide the sum by the number of markers used*2 (allele basis)
+***
+## Introgression Mapping
+**19. Introgression_detect_perPop.Rmd:**
