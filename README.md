@@ -111,12 +111,19 @@
 - OUTPUT: Per-chromosome .tsv files with columns Marker (ChrPos), REF, ALT, followed by all sample columns, with genotype calls for each marker
 - Uses BCFtools query to get sample IDs and construct the matrix header, and extract POS, REF, ALT, and TGT fields, followed by an awk command to append chromosome prefix to marker positions
 ***
-
-
-
-
-
-
-
-
-
+**14. filter_byPopulation.sh:** Per-population filtering of pairs of parental markers (RP vs donor)
+- INPUT:
+  - Per-chromosome matrix of parental allele calls by marker (.tsv from step 13)
+  - Population manifest denoting per-population RP and donor (headings: Population, RP, DONOR_AB, DONOR_D)
+- OUTPUT: For each population found in the manifest, write:
+  - Subset .tsv containing only the parents respective to that population (Marker, REF, ALT, RP, DONOR)
+  - Fail report containing a list of markers and why they failed
+      - MISSING_PARENT: either parent is missing
+      - HET_PARENT: either parent is heterozygous
+      - MONOMORPHIC: both parents homozygous but have the same allele (uninformative for RP vs. donor)
+  - Kept marker table with informative, nonfailing markers
+  - Per-chromosome summary counts including marker totals, how many were kept, and how many were dropped for each reason and total
+  - Population-level running union of dropped markers across chromosomes
+- PARAMETER MODIFICATION: Update population manifest as needed
+- Runs over the 21 chromosomes and uses awk commands to generate outputs for per-population filtering
+***
