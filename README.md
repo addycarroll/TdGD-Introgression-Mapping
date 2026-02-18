@@ -150,9 +150,51 @@
 ***
 ## Prepare input files for AlphaImpute2
 **16. merge_markers_by_chr_by_pop.Rmd:** Merge array- and sequence-based genotype matrices by chromosome
-** 16.1:**
+**16.1:**
 - INPUT:
   - Per-population array hapmap files
   - Per-population, per-chromosome thinned parent genotype matrices
 - OUTPUT:
-  - Merged matrices by 
+  - Merged matrices by population x chromosome
+  - REF/ALT conflict log
+  - Marker keep/drop lists
+- PARAMETER MODIFICATION:
+  - Thinning label used to locate parent files (e.g., 250kb)
+  - Chunk size for streaming merging and writing
+- For each population x chromosome:
+  - Subset array markers by chromosome
+  - Read the corresponding thinned parent matrix
+  - Recode missing to 9
+  - Merge by marker using a union join
+  - Write merged table in chunks to manage memory
+  - Detect REF/ALT conflicts and log
+**16.2:**
+- INPUT:
+  - Merged matrices from step 16.1
+  - Recalled parent genotypes at target array sites from step 10b
+  - Population parent manifest with columns Population, RP, DONOR_AB, DONOR_D
+- OUTPUT
+  - Updated merged matrices with missing RP and/or DONOR filled where possible
+  - Per-population QC mismatch lists
+- PARAMETER MODIFICATION:
+  - Update parent IDs in population manifest as needed
+  - Contig to chromosome mapping if reference contig names differ
+- For each merged population x chromosome matrix:
+  - Identify the appropriate RP and donor columns in the recalled file
+  - Convert recalled marker IDs to the chr_pos format if needed
+  - Intersect markers between merged and recalled data and drop overlaps unless REF/ALT labels exactly match
+  - For concordant overlaps, fill RP and DONOR genotypes when missing in the merged matrix 
+**16.3:**
+- INPUT: Merged and filled matrices from step 16.2
+- OUTPUT:
+  - Filtered matrices
+  - Per-file log table indicating reasons for marker removal and counts removed for each reason
+    - removed_RP_missing
+    - removed_DONOR_missing
+    - removed_RP_not_homozygous
+    - removed_DONOR_not_homozygous
+    - removed_not_polymorphic
+- For each merged file:
+  - Classify each marker by whether any parent call exists and whether any progeny call exists
+  - Retain only markers where both parents are non-missing, homozygous, and polymorphic between RP and DONOR
+  - Write filtered outputs and generate a log summarizing before/after counts and removal reasons
