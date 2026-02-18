@@ -1,0 +1,705 @@
+```{r}
+###########################################################################################################
+## Merge array hapmap and thinned recalled parents by population x chromosome with REF/ALT conflict logging
+###########################################################################################################
+
+### SPLIT BY POP ###
+library(data.table)
+library (stringr)
+
+# ------------------ CONFIG ------------------
+# Top-level genotype directory for this project.
+GENO_DIR   <- "/bulk/akf/Addy/Introgression_mapping/Genotype_matrices"
+# Directory containing "thinned" sequencing-derived parent genotype matrices (by pop and chr)
+THIN_DIR   <- file.path(GENO_DIR, "filter_byPopulation", "thinned_markers")
+# Output root directory for merged-by-population matrices.
+# This script creates:
+#   MERGE_DIR/PopXX/chr<CHR>_PopXX_merged.tsv
+# plus QC files under:
+#   MERGE_DIR/PopXX/qc_refalt/
+MERGE_DIR  <- file.path(GENO_DIR, "Merged_byPopulation")
+dir.create(MERGE_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# chromosomes
+chroms <- c(paste0(1:7, "A"), paste0(1:7, "B"), paste0(1:7, "D"))
+
+# Optional list of population numbers that should use 250kb thinning instead of the default
+# NOTE: In the current code, bin_bp is hard-coded to 250000L in both branches below so POPS_250K currently has no effect (see "bin rule" section)
+POPS_250K <- c("")
+
+# discover populations from per-pop hapmaps
+hapmaps <- list.files(GENO_DIR, pattern = "^Pop[0-9]+_CRHetFilter_Hapmap\\.tsv$", full.names = TRUE)
+if (length(hapmaps) == 0L) stop("No per-pop hapmaps found in GENO_DIR")
+
+# HELPER: convert numeric bp window size into filename label used in your thinning outputs
+# 250000 -> 250kb, 1000000 -> 1Mb, etc.
+label_bp <- function(bp) {
+  if (bp %% 1e6 == 0) sprintf("%dMb", bp/1e6)
+  else if (bp %% 1e3 == 0) sprintf("%dkb", bp/1e3)
+  else sprintf("%dbp", bp)
+}
+
+# ------------------ HELPERS ------------------
+# recode_one():
+# Standardizes missing genotype encodings across files
+recode_one <- function(DT, colname){
+  v <- as.character(DT[[colname]])
+  v <- gsub("\r", "", v, fixed = TRUE)
+  v <- trimws(v)
+  mask <- is.na(v) | v == "" | v == "./." | toupper(v) == "NA"
+  v[mask] <- "9"
+  data.table::set(DT, j = colname, value = v)
+}
+# recode_many(): convenience wrapper over recode_one()
+recode_many <- function(DT, cols){ for (j in cols) recode_one(DT, j); invisible(NULL) }
+
+# Collapse duplicated REF/ALT columns in case of rerunning without reloading files
+coalesce_ref_alt <- function(DT){
+  rA <- intersect(c("REF.array","REF.x"), names(DT)); rA <- if (length(rA)) rA[1] else NA_character_
+  rS <- intersect(c("REF.seq","REF.y"), names(DT));   rS <- if (length(rS)) rS[1] else NA_character_
+  aA <- intersect(c("ALT.array","ALT.x"), names(DT)); aA <- if (length(aA)) aA[1] else NA_character_
+  aS <- intersect(c("ALT.seq","ALT.y"), names(DT));   aS <- if (length(aS)) aS[1] else NA_character_
+  if (!"REF" %in% names(DT)) DT[, REF := NA_character_]
+  if (!"ALT" %in% names(DT)) DT[, ALT := NA_character_]
+  if (!is.na(rA) || !is.na(rS)) {
+    DT[, REF := fcoalesce(if (!is.na(rA)) DT[[rA]] else NULL,
+                          if (!is.na(rS)) DT[[rS]] else NULL, REF)]
+    DT[, c(rA, rS) := NULL]
+  }
+  if (!is.na(aA) || !is.na(aS)) {
+    DT[, ALT := fcoalesce(if (!is.na(aA)) DT[[aA]] else NULL,
+                          if (!is.na(aS)) DT[[aS]] else NULL, ALT)]
+    DT[, c(aA, aS) := NULL]
+  }
+  invisible(DT)
+}
+
+# Ensure every output file has the same sample columns in the same order
+finalize_columns <- function(DT, meta_cols, all_samples){
+  missing_samples <- setdiff(all_samples, names(DT))
+  for (j in missing_samples) DT[, (j) := "9"]
+  for (j in all_samples) {
+    v <- as.character(DT[[j]]); v[is.na(v)] <- "9"
+    data.table::set(DT, j = j, value = v)
+  }
+  if (!"REF" %in% names(DT)) DT[, REF := NA_character_]
+  if (!"ALT" %in% names(DT)) DT[, ALT := NA_character_]
+  setcolorder(DT, c("Marker","REF","ALT", all_samples))
+  invisible(DT)
+}
+
+# ------------------ MAIN LOOP (per population) ------------------
+for (hap in hapmaps) {
+  # parse population ID from filename 
+  POP <- sub("_CRHetFilter_Hapmap\\.tsv$", "", basename(hap))  # e.g., "Pop30"
+  pop_num <- sub("^Pop", "", POP)  # "30", "32", ..., "80"
+  message("\n==============================")
+  message("Population: ", POP)
+
+  # bin rule
+  bin_bp   <- if (pop_num %chin% POPS_250K) 250000L else 250000L
+  bin_lab  <- label_bp(bin_bp)
+
+  # per-pop merge & QC dirs
+  MERGE_POP <- file.path(MERGE_DIR, POP) # holds merged chr files
+  QC_DIR    <- file.path(MERGE_POP, "qc_refalt") # holds conflict reports and marker keep/drop lists
+  dir.create(MERGE_POP, showWarnings = FALSE, recursive = TRUE)
+  dir.create(QC_DIR,    showWarnings = FALSE, recursive = TRUE)
+
+  # load full pop hapmap once - subset by chr in loop
+  arr_full <- fread(hap, sep = "\t", na.strings = c("", "NA"), quote = "")
+  if (!"Marker" %in% names(arr_full)) stop("Hapmap missing 'Marker' column for ", POP)
+  meta_cols <- c("Marker","REF","ALT") # columns expected in both array and seq tables
+
+  for (CHR in chroms) {
+    message(">>> Processing ", POP, " chr ", CHR)
+
+    # subset array (per-pop hapmap) to this chromosome
+    arr <- arr_full[grepl(paste0("^chr", CHR, "_"), Marker, perl = TRUE)]
+    if (nrow(arr) == 0L) {
+      message("No array markers for ", POP, " chr", CHR, " — skipping")
+      next
+    }
+
+    # Path to thinned sequencing-derived parents file for this pop and chr
+    # Uses numeric population subdir and bin label in filename
+    seq_file <- file.path(THIN_DIR, pop_num, sprintf("chr%s_%s_thinned_%s.tsv", CHR, pop_num, bin_lab))
+    if (!file.exists(seq_file)) {
+      message("No thinned parents file found: ", seq_file, " — skipping chr")
+      next
+    }
+    seq <- fread(seq_file, sep = "\t", na.strings = c("", "NA"), quote = "")
+
+    # recode NAs/missing to 9
+    recode_many(arr, setdiff(names(arr), meta_cols))
+    recode_many(seq, setdiff(names(seq), meta_cols))
+
+    # set keys for fast joins/merges by marker ID
+    setkey(arr, Marker); setkey(seq, Marker)
+
+    # build the union marker list for this chromosome
+    # all markers present in array or seq sorted by the last numeric substring in Marker
+    # this assumes the final integer corresponds to physical position
+    all_markers_dt <- data.table(Marker = unique(c(arr$Marker, seq$Marker)))
+    m <- regexpr("(\\d+)(?!.*\\d)", all_markers_dt$Marker, perl = TRUE)
+    pos_str <- ifelse(m > 0, regmatches(all_markers_dt$Marker, m), NA_character_)
+    all_markers_dt[, pos := as.integer(pos_str)]
+    all_markers_dt[, pos_na := is.na(pos)]
+    setorder(all_markers_dt, pos_na, pos, Marker)
+    all_markers <- unique(all_markers_dt$Marker)
+
+    # sample columns
+    arr_geno <- setdiff(names(arr), meta_cols)
+    seq_geno <- setdiff(names(seq), meta_cols)
+    all_samples <- c(arr_geno, setdiff(seq_geno, arr_geno))
+    final_cols  <- c(meta_cols, all_samples)
+
+    # output file (per pop × chr)
+    OUT_FILE <- file.path(MERGE_POP, sprintf("chr%s_%s_merged.tsv", CHR, POP))
+    # write header once
+    header_dt <- as.data.table(setNames(replicate(length(final_cols), character(0), simplify = FALSE), final_cols))
+    fwrite(header_dt, OUT_FILE, sep = "\t", quote = FALSE)
+
+    # chunked merge/write to avoid holding entire chromosome union in memory
+    chunk_size <- 100000L
+    n_chunks <- as.integer(ceiling(length(all_markers) / chunk_size))
+    pb <- txtProgressBar(min = 0, max = n_chunks, style = 3)
+    t0 <- Sys.time(); last_tick <- t0
+
+    for (k in seq_len(n_chunks)) {
+      i1 <- (k - 1L) * chunk_size + 1L
+      i2 <- min(k * chunk_size, length(all_markers))
+      mks <- unique(all_markers[i1:i2])
+
+      arr_chunk <- arr[.(mks)]
+      seq_chunk <- seq[.(mks)]
+
+      chunk <- merge(arr_chunk, seq_chunk, by = "Marker", all = TRUE, suffixes = c(".array",".seq"))
+
+      # REF/ALT conflict detection
+      chunk[, ref_conflict := !is.na(REF.array) & !is.na(REF.seq) & REF.array != REF.seq]
+      chunk[, alt_conflict := !is.na(ALT.array) & !is.na(ALT.seq) & ALT.array != ALT.seq]
+      chunk[, any_conflict := ref_conflict | alt_conflict]
+
+      # if any conflicts occur in this chunk append conflict rows to a per-chr file
+      # output columns preserve both array and seq allele labels for inspection
+      if (any(chunk$any_conflict, na.rm = TRUE)) {
+        conf_out <- file.path(QC_DIR, sprintf("chr%s_REFALT_conflicts.tsv", CHR))
+        conf_chunk <- unique(
+          chunk[any_conflict == TRUE, .(Marker, REF.array, ALT.array, REF.seq, ALT.seq)],
+          by = "Marker"
+        )
+        fwrite(conf_chunk, conf_out, sep = "\t",
+               append = file.exists(conf_out),
+               col.names = !file.exists(conf_out))
+      }
+
+      chunk[, c("ref_conflict","alt_conflict","any_conflict") := NULL]
+      coalesce_ref_alt(chunk)
+      finalize_columns(chunk, meta_cols, all_samples)
+
+      fwrite(chunk, OUT_FILE, sep = "\t", quote = FALSE, append = TRUE)
+
+      setTxtProgressBar(pb, k)
+      now <- Sys.time()
+      dt  <- as.numeric(difftime(now, last_tick, units = "secs"))
+      avg <- as.numeric(difftime(now, t0, units = "secs")) / k
+      eta <- (n_chunks - k) * avg
+      if (k == 1L || k %% 5L == 0L || k == n_chunks) {
+        message(sprintf("[%s %s] Chunk %d/%d | rows=%d | %.2fs (last) | %.2fs (avg) | ETA %.1fs",
+                        POP, CHR, k, n_chunks, nrow(chunk), dt, avg, eta))
+      }
+      last_tick <- now
+
+      rm(arr_chunk, seq_chunk, chunk); gc(verbose = FALSE)
+    }
+    close(pb)
+
+    message(sprintf("Done merging %s chr%s: %d markers", POP, CHR, length(all_markers)))
+
+    # ------------ REF/ALT QC lists (per pop × chr) ------------
+    common <- intersect(arr$Marker, seq$Marker)
+    if (length(common)) {
+      # pull REF/ALT from each source for common markers.
+      a <- arr[.(common), .(Marker, REF_a = REF, ALT_a = ALT)]
+      s <- seq[.(common), .(Marker, REF_s = REF, ALT_s = ALT)]
+      cmp <- merge(a, s, by = "Marker", all = FALSE)
+
+      is_base <- function(x) !is.na(x) & grepl("^[ACGT]$", x)
+      
+      # palindromic SNVs are A/T or C/G - where strand flips are ambiguous
+      is_pal  <- function(r, a) {
+        is_base(r) & is_base(a) &
+          ( (r == "A" & a == "T") | (r == "T" & a == "A") |
+            (r == "C" & a == "G") | (r == "G" & a == "C") )
+      }
+      comp_base <- function(b) chartr("ACGT","TGCA", b)
+      cmp[, snv := is_base(REF_a) & is_base(ALT_a) & is_base(REF_s) & is_base(ALT_s)]
+      cmp[, pal := is_pal(REF_a, ALT_a) & is_pal(REF_s, ALT_s)]
+
+      # Classify relationship of allele labels:
+      # - match: same REF/ALT
+      # - swapped: REF/ALT reversed
+      # - complement: both complemented (strand flip)
+      # - comp+swap: complemented and swapped
+      # - palindromic_snv: palindromic SNV (ambiguous)
+      # - indel_or_other: anything non [ACGT]/[ACGT]
+      cmp[, status := fifelse(snv & !pal & REF_a == REF_s & ALT_a == ALT_s, "match",
+                       fifelse(snv & !pal & REF_a == ALT_s & ALT_a == REF_s, "swapped",
+                       fifelse(snv & !pal & comp_base(REF_a) == REF_s & comp_base(ALT_a) == ALT_s, "complement",
+                       fifelse(snv & !pal & comp_base(REF_a) == ALT_s & comp_base(ALT_a) == REF_s, "comp+swap",
+                       fifelse(snv & pal, "palindromic_snv", "indel_or_other")))))]
+
+      cmp[snv & !pal & !status %chin% c("match","swapped","complement","comp+swap"),
+          status := "discordant"]
+
+      bad_status <- c("swapped","complement","comp+swap","discordant","palindromic_snv","indel_or_other")
+      cmp[, bad_missing := is.na(REF_a) | is.na(ALT_a) | is.na(REF_s) | is.na(ALT_s)]
+
+      # markers to drop among the common set based on discordance
+      drop_common <- unique(c(
+        cmp[status %chin% bad_status, Marker],
+        cmp[bad_missing == TRUE, Marker]
+      ))
+
+      # keep common markers that are clean matches
+      keep_common <- setdiff(common, drop_common)
+      # markers unique to either source are kept
+      arr_only <- setdiff(arr$Marker, seq$Marker)
+      seq_only <- setdiff(seq$Marker, arr$Marker)
+      keep_all <- unique(c(arr_only, seq_only, keep_common))
+
+      # write keep/drop marker lists for downstream use
+      f_keep <- file.path(QC_DIR, sprintf("chr%s_keep_markers.txt", CHR))
+      f_drop <- file.path(QC_DIR, sprintf("chr%s_drop_mismatches_incl_palindromes.txt", CHR))
+      fwrite(data.table(Marker = keep_all), f_keep, col.names = FALSE, sep = "\t")
+      fwrite(data.table(Marker = drop_common), f_drop, col.names = FALSE, sep = "\t")
+
+      tot_union <- length(unique(c(arr$Marker, seq$Marker)))
+      message(sprintf("QC %s chr%s: common=%d | drop=%d | keep=%d of %d (%.2f%%)",
+                      POP, CHR, length(common), length(drop_common),
+                      length(keep_all), tot_union,
+                      if (tot_union > 0) 100*length(keep_all)/tot_union else 0))
+    } else {
+      message("No common markers between array and seq on ", POP, " chr", CHR, " (union-only output).")
+    }
+  } # chr loop
+} # pop loop
+
+### NOTE: QC keep/drop lists are not applied to the merged tsv and are written for downstream filtering
+
+```
+
+```{r}
+
+##########################################################################################################################
+## Fill missing RP/DONOR genotype calls in merged files using the recalled parent matrix with allele concordance screening
+##########################################################################################################################
+
+### Fill recalled variants - by population ###
+
+suppressPackageStartupMessages({ library(data.table); library(stringr) })
+
+# ========= CONFIG =========
+## Root of the merged per population output from chunk 1
+MERGED_ROOT <- "/bulk/akf/Addy/Introgression_mapping/Genotype_matrices/Merged_byPopulation"
+# Sequencing-derived recalled at array sites parent genotypes
+RECALLED    <- "/bulk/akf/Addy/Introgression_mapping/Genotype_matrices/Parents_arraySites_D250_alleleGenos_Q30_DP10-150_UNFILTERED.tsv"
+
+# Pop -> parent mapping
+# Population is the numeric suffix used in paths ("30","32",...)
+# RP is the recurrent parent sample column name in RECALLED
+# DONOR_AB / DONOR_D are the donor sample column names in RECALLED depending on subgenome
+popmap <- data.table(
+  Population = c("30","32","34","41","42","46","80"),
+  RP         = c("KS061416LN~26","KS061416LN~26","KS061416LN~26","KS061278M-4","KS061278M-4","KS061278M-4","KS061278M-4"),
+  DONOR_AB   = c("PI414718","PI470736","PI487264","PI428088","PI466984","PI471815","PI471021"),
+  DONOR_D    = c("TA2398","TA2398","TA2398","TA2398","TA2398","TA2398","TA10155")
+)
+
+# Contig -> chr mapping
+contig_to_chr <- c(
+  "LS992080.1"="1A","LS992081.1"="1B","LS992082.1"="1D",
+  "LS992083.1"="2A","LS992084.1"="2B","LS992085.1"="2D",
+  "LS992086.1"="3A","LS992087.1"="3B","LS992088.1"="3D",
+  "LS992089.1"="4A","LS992090.1"="4B","LS992091.1"="4D",
+  "LS992092.1"="5A","LS992093.1"="5B","LS992094.1"="5D",
+  "LS992095.1"="6A","LS992096.1"="6B","LS992097.1"="6D",
+  "LS992098.1"="7A","LS992099.1"="7B","LS992100.1"="7D"
+)
+
+# ========= HELPERS =========
+is_base   <- function(x) !is.na(x) & grepl("^[ACGT]$", x)
+comp_base <- function(b) chartr("ACGT","TGCA", b)
+is_pal    <- function(r,a) is_base(r)&is_base(a) & ((r=="A"&a=="T")|(r=="T"&a=="A")|(r=="C"&a=="G")|(r=="G"&a=="C"))
+status_one <- function(rN,aN,rT,aT){
+  if (all(is_base(c(rN,aN,rT,aT)))){
+    if (rN==rT && aN==aT) "match"
+    else if (rN==aT && aN==rT) "swapped"
+    else if (comp_base(rN)==rT && comp_base(aN)==aT) "complement"
+    else if (comp_base(rN)==aT && comp_base(aN)==rT) "comp+swap"
+    else if (is_pal(rN,aN) || is_pal(rT,aT)) "palindromic_snv"
+    else "discordant"
+  } else "indel_or_other"
+}
+is_missing <- function(v) v %in% c("9","./.","", NA_character_)
+
+# ========= load recalled once, normalize markers =========
+cat(sprintf("[%s] Loading recalled variants: %s\n", Sys.time(), RECALLED))
+rec_all <- fread(RECALLED, sep="\t", quote="", na.strings=c("", "NA"))
+stopifnot(all(c("Marker","REF","ALT") %in% names(rec_all)))
+
+# If recalled markers are not already "chr<CHR>_<pos>", convert contig_pos to chr_pos
+if (!startsWith(rec_all$Marker[1], "chr")) {
+  parts <- tstrsplit(rec_all$Marker, "_", fixed=TRUE)
+  contig <- parts[[1]]; pos <- parts[[2]]
+  chr_lbl <- contig_to_chr[contig]
+  if (any(is.na(chr_lbl))) stop("Unmapped contigs present in recalled variants file.")
+  rec_all[, Marker := paste0("chr", chr_lbl, "_", pos)]
+}
+if (anyDuplicated(rec_all$Marker)) {
+  setkey(rec_all, Marker)
+  rec_all <- unique(rec_all, by="Marker")
+}
+
+meta_cols   <- c("Marker","REF","ALT")
+rec_samples <- setdiff(names(rec_all), meta_cols)
+
+# ========= find all merged files under PopXX/ =========
+# Note: This searches recursively, so it will also find files in subdirectories if they match the pattern
+files <- list.files(
+  MERGED_ROOT,
+  pattern="^chr[1-7][ABD]_Pop[0-9]+_merged\\.tsv$",
+  recursive=TRUE, full.names=TRUE
+)
+if (!length(files)) stop("No merged files found under: ", MERGED_ROOT)
+
+for (f in files) {
+  base <- basename(f)
+  pop_dir <- dirname(f) 
+  qc_dir  <- file.path(pop_dir, "qc_refalt")
+  dir.create(qc_dir, showWarnings = FALSE, recursive = TRUE)
+
+  # parse CHR and POP number from filename
+  m <- stringr::str_match(base, "^chr([1-7][ABD])_Pop([0-9]+)_merged\\.tsv$")
+  if (any(is.na(m))) { cat("[warn] skip unparseable file:", base, "\n"); next }
+  CHR <- m[2]; POP <- m[3]
+
+  # identify which parent columns we need for this pop and chr type
+  row <- popmap[Population == POP]
+  if (nrow(row) != 1L) { cat(sprintf("[warn] unknown pop %s in %s; skip\n", POP, base)); next }
+  RP_name    <- row$RP
+  DONOR_name <- if (endsWith(CHR, "D")) row$DONOR_D else row$DONOR_AB
+
+  # confirm recalled matrix actually contains those parent sample columns
+  need_cols <- c(RP_name, DONOR_name)
+  if (!all(need_cols %in% rec_samples)) {
+    cat(sprintf("[warn] recalled missing parent cols for Pop%s chr%s (%s); skip\n",
+                POP, CHR, paste(setdiff(need_cols, rec_samples), collapse=", ")))
+    next
+  }
+
+  # load merged file
+  dt <- fread(f, sep="\t", quote="", na.strings=c("", "NA"))
+  # this script assumes merged files contain explicit parent columns RP and DONOR
+  # those columns must exist or this file is skipped
+  if (!all(c("Marker","REF","ALT","RP","DONOR") %in% names(dt))) {
+    cat(sprintf("[warn] file missing required cols (Marker/REF/ALT/RP/DONOR): %s; skip\n", base))
+    next
+  }
+
+  rec_chr <- rec_all[grepl(paste0("^chr", CHR, "_"), Marker),
+                     .(Marker, REF, ALT,
+                       RP_fill    = get(RP_name),
+                       DONOR_fill = get(DONOR_name))]
+  if (!nrow(rec_chr)) { cat(sprintf("[info] no recalled calls for chr%s (%s); skip\n", CHR, base)); next }
+
+  for (j in c("RP_fill","DONOR_fill")) {
+    v <- as.character(rec_chr[[j]]); v[is_missing(v)] <- "9"; set(rec_chr, j=j, value=v)
+  }
+
+  # ---------- concordance screen ----------
+  # merge allele labels (REF/ALT) between merged and recalled for overlapping markers then classify status for each overlap
+  # this drops all overlaps whose REF/ALT labels are not an exact match.
+  cmp <- merge(
+    dt[, .(Marker, REFT=REF, ALTT=ALT)],
+    rec_chr[, .(Marker, REFN=REF, ALTN=ALT)],
+    by="Marker", all=FALSE
+  )
+  cmp[, status := mapply(status_one, REFN, ALTN, REFT, ALTT)]
+  bad <- cmp[status != "match", unique(Marker)]
+  if (length(bad)) {
+    fwrite(data.table(Marker = bad),
+           file.path(qc_dir, sprintf("chr%s_drop_mismatches_incl_palindromes.txt", CHR)),
+           col.names = FALSE, sep = "\t")
+  }
+
+  keep <- setdiff(dt$Marker, bad)
+  if (!length(keep)) { cat(sprintf("Pop%s chr%s: all overlaps non-concordant; skip\n", POP, CHR)); next }
+  dt      <- dt[Marker %in% keep]
+  rec_chr <- rec_chr[Marker %in% keep]
+
+  # fill only missing RP/DONOR
+  setkey(dt, Marker); setkey(rec_chr, Marker)
+  hits <- rec_chr[dt, nomatch=0]
+
+  rp_miss <- is_missing(hits$RP)    & (hits$RP_fill    != "9")
+  dn_miss <- is_missing(hits$DONOR) & (hits$DONOR_fill != "9")
+
+  if (any(rp_miss)) set(dt, i = dt[hits$Marker[rp_miss], which=TRUE, on="Marker"], j="RP",    value = hits$RP_fill[rp_miss])
+  if (any(dn_miss)) set(dt, i = dt[hits$Marker[dn_miss], which=TRUE, on="Marker"], j="DONOR", value = hits$DONOR_fill[dn_miss])
+
+  # save back to the same file path
+  out_tmp <- paste0(f, ".tmp")
+  fwrite(dt, out_tmp, sep="\t", quote=FALSE)
+  file.rename(out_tmp, f)
+
+  cat(sprintf("Pop%s chr%s | dropped=%d | filled RP=%d, DONOR=%d | %s\n",
+              POP, CHR, length(bad), sum(rp_miss), sum(dn_miss), base))
+}
+
+cat(sprintf("[%s] All files processed.\n", Sys.time()))
+
+```
+
+```{r}
+
+
+#########################################################################################
+## Remove markers where the RP and Donor aren't non missing, polymorphic, and homozygous
+#########################################################################################
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(stringr)
+})
+
+# ===================== CONFIG =====================
+MERGED_ROOT <- "/bulk/akf/Addy/Introgression_mapping/Genotype_matrices/Merged_byPopulation"
+
+# Input files pattern
+IN_PATTERN  <- "^chr[1-7][ABD]_Pop[0-9]+_merged\\.tsv$"
+
+# Output
+OUT_TAG     <- "parentHomPoly"  # suffix inserted before ".tsv"
+WRITE_FILTERED_FILES <- TRUE
+
+# Where to put filtered files + logs
+OUTDIR_FILTERED <- file.path(MERGED_ROOT, "filtered_parentHomPoly")
+dir.create(OUTDIR_FILTERED, recursive = TRUE, showWarnings = FALSE)
+
+# Per-file log capturing counts before/after and removal reasons
+LOG_FILE <- file.path(OUTDIR_FILTERED, paste0("marker_filter_log_", OUT_TAG, ".tsv"))
+# ==================================================
+
+
+# ---------- HELPERS ----------
+is_missing9 <- function(x) is.na(x) | x == "9" | x == ""
+
+# Homozygous allele string test
+is_hom_allelestr <- function(x) {
+  y <- as.character(x)
+  y <- str_replace_all(y, "\\s+", "")
+  m <- str_match(y, "^([ACGT])([/|])([ACGT])$")
+  ok <- !is.na(m[,1])
+  hom <- rep(FALSE, length(y))
+  hom[ok] <- m[ok,2] == m[ok,4]
+  hom
+}
+
+# Extract a standardized representation of genotype (for RP vs DONOR comparison)
+# For homozygotes just keep the allele string as is
+# Convert A|A to A/A so comparison is consistent
+normalize_allelestr <- function(x) {
+  y <- as.character(x)
+  y <- str_replace_all(y, "\\s+", "")
+  y <- str_replace_all(y, "\\|", "/")
+  y
+}
+
+# Determine category for each marker:
+# parent_call  = at least one of RP or DONOR is non-missing
+# progeny_call = at least one progeny sample non-missing
+# Categories are mutually exclusive:
+# sequence_only: parent_call TRUE, progeny_call FALSE
+# progeny_only : parent_call FALSE, progeny_call TRUE
+# shared       : parent_call TRUE, progeny_call TRUE
+# none         : parent_call FALSE, progeny_call FALSE
+get_provenance <- function(parent_call, progeny_call) {
+  out <- character(length(parent_call))
+  out[parent_call & !progeny_call] <- "sequence_only"
+  out[!parent_call & progeny_call] <- "progeny_only"
+  out[parent_call & progeny_call]  <- "shared"
+  out[!parent_call & !progeny_call] <- "none"
+  out
+}
+
+# ---------- discover files ----------
+files <- list.files(
+  MERGED_ROOT, pattern = IN_PATTERN,
+  recursive = TRUE, full.names = TRUE
+)
+
+if (!length(files)) stop("No merged files found under: ", MERGED_ROOT)
+
+
+# ---------- main loop ----------
+log_rows <- vector("list", length(files))
+
+for (i in seq_along(files)) {
+  f <- files[i]
+  base <- basename(f)
+
+  # Read file
+  dt <- fread(f, sep = "\t", quote = "", na.strings = c("", "NA"))
+  # Required columns
+  req <- c("Marker","REF","ALT","RP","DONOR")
+  if (!all(req %in% names(dt))) {
+    log_rows[[i]] <- data.table(
+      file = f, status = "SKIP_missing_required_cols",
+      markers_before = NA_integer_
+    )
+    next
+  }
+
+  # Identify progeny columns (everything except meta + parents)
+  meta_cols <- c("Marker","REF","ALT","RP","DONOR")
+  progeny_cols <- setdiff(names(dt), meta_cols)
+
+  # Convert relevant columns to character
+  dt[, RP := as.character(RP)]
+  dt[, DONOR := as.character(DONOR)]
+ 
+  # parent_call is TRUE if at least one parent has a genotype call
+  parent_call <- !(is_missing9(dt$RP) & is_missing9(dt$DONOR))
+  # progeny_call is TRUE if ANY progeny sample in the row is non-missing
+  progeny_call <- rep(FALSE, nrow(dt))
+  if (length(progeny_cols) > 0) {
+    P <- dt[, ..progeny_cols]
+    for (cc in names(P)) set(P, j = cc, value = as.character(P[[cc]]))
+    non9_counts <- P[, rowSums(.SD != "9" & .SD != "" & !is.na(.SD)), .SDcols = progeny_cols]
+    progeny_call <- non9_counts > 0
+  }
+
+  prov_before <- get_provenance(parent_call, progeny_call)
+
+  n_before <- nrow(dt)
+  before_seq  <- sum(prov_before == "sequence_only")
+  before_prog <- sum(prov_before == "progeny_only")
+  before_shar <- sum(prov_before == "shared")
+  before_none <- sum(prov_before == "none")
+
+  # sanity check: categories should sum to total rows
+  if ((before_seq + before_prog + before_shar + before_none) != n_before) {
+    stop("Provenance categories do not sum to total in file: ", f)
+  }
+
+  # ----- FILTER: RP/DONOR non-missing, homozygous, polymorphic -----
+  rp_missing <- is_missing9(dt$RP)
+  dn_missing <- is_missing9(dt$DONOR)
+
+  rp_norm <- normalize_allelestr(dt$RP)
+  dn_norm <- normalize_allelestr(dt$DONOR)
+
+  rp_hom <- !rp_missing & is_hom_allelestr(rp_norm)
+  dn_hom <- !dn_missing & is_hom_allelestr(dn_norm)
+
+  # polymorphic between parents: both hom+nonmissing and different
+  parents_poly <- rp_hom & dn_hom & (rp_norm != dn_norm)
+
+  keep <- parents_poly
+
+  # ----- REMOVAL REASONS (mutually exclusive) -----
+  # Order matters - each marker assigned to the first rule it fails
+  reason <- character(n_before)
+  reason[rp_missing] <- "removed_RP_missing"
+  reason[reason == "" & dn_missing] <- "removed_DONOR_missing"
+  reason[reason == "" & !rp_missing & !is_hom_allelestr(rp_norm)] <- "removed_RP_not_homozygous"
+  reason[reason == "" & !dn_missing & !is_hom_allelestr(dn_norm)] <- "removed_DONOR_not_homozygous"
+  reason[reason == "" & rp_hom & dn_hom & (rp_norm == dn_norm)] <- "removed_not_polymorphic"
+  reason[reason == "" & !keep] <- "removed_other"
+  removed_total <- sum(!keep)
+  removed_RP_missing        <- sum(reason == "removed_RP_missing")
+  removed_DONOR_missing     <- sum(reason == "removed_DONOR_missing")
+  removed_RP_not_hom        <- sum(reason == "removed_RP_not_homozygous")
+  removed_DONOR_not_hom     <- sum(reason == "removed_DONOR_not_homozygous")
+  removed_not_poly          <- sum(reason == "removed_not_polymorphic")
+  removed_other             <- sum(reason == "removed_other")
+
+  dt_keep <- dt[keep]
+
+  parent_call_k <- !(is_missing9(dt_keep$RP) & is_missing9(dt_keep$DONOR))
+  progeny_call_k <- rep(FALSE, nrow(dt_keep))
+  if (nrow(dt_keep) > 0 && length(progeny_cols) > 0) {
+    Pk <- dt_keep[, ..progeny_cols]
+    for (cc in names(Pk)) set(Pk, j = cc, value = as.character(Pk[[cc]]))
+    non9_counts_k <- Pk[, rowSums(.SD != "9" & .SD != "" & !is.na(.SD)), .SDcols = progeny_cols]
+    progeny_call_k <- non9_counts_k > 0
+  }
+  prov_after <- get_provenance(parent_call_k, progeny_call_k)
+
+  n_after <- nrow(dt_keep)
+  after_seq  <- sum(prov_after == "sequence_only")
+  after_prog <- sum(prov_after == "progeny_only")
+  after_shar <- sum(prov_after == "shared")
+  after_none <- sum(prov_after == "none")
+
+  # ----- write filtered file -----
+  out_file <- NA_character_
+  if (WRITE_FILTERED_FILES) {
+    # keep same relative PopXX subdir structure under OUTDIR_FILTERED
+    rel <- sub(paste0("^", gsub("([\\^\\$\\.|\\+\\*\\?\\(\\)\\[\\]\\{\\}\\\\])","\\\\\\1", MERGED_ROOT), "/?"), "", f)
+    out_dir <- file.path(OUTDIR_FILTERED, dirname(rel))
+    dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+    out_file <- file.path(out_dir, sub("\\.tsv$", paste0(".", OUT_TAG, ".tsv"), basename(rel)))
+    tmp <- paste0(out_file, ".tmp")
+    fwrite(dt_keep, tmp, sep = "\t", quote = FALSE, na = "NA")
+    file.rename(tmp, out_file)
+  }
+
+  # ----- log row -----
+  log_rows[[i]] <- data.table(
+    file = f,
+    out_file = out_file,
+    status = "OK",
+
+    markers_before = n_before,
+    before_sequence_only = before_seq,
+    before_progeny_only  = before_prog,
+    before_shared        = before_shar,
+    before_none          = before_none,
+
+    markers_kept = n_after,
+    kept_sequence_only = after_seq,
+    kept_progeny_only  = after_prog,
+    kept_shared        = after_shar,
+    kept_none          = after_none,
+
+    markers_removed = removed_total,
+    removed_RP_missing = removed_RP_missing,
+    removed_DONOR_missing = removed_DONOR_missing,
+    removed_RP_not_homozygous = removed_RP_not_hom,
+    removed_DONOR_not_homozygous = removed_DONOR_not_hom,
+    removed_not_polymorphic = removed_not_poly,
+    removed_other = removed_other
+  )
+}
+
+log_dt <- rbindlist(log_rows, fill = TRUE)
+
+log_dt[, before_sum := before_sequence_only + before_progeny_only + before_shared + before_none]
+log_dt[, kept_sum   := kept_sequence_only + kept_progeny_only  + kept_shared  + kept_none]
+log_dt[, before_sums_ok := (before_sum == markers_before)]
+log_dt[, kept_sums_ok   := (kept_sum == markers_kept)]
+
+fwrite(log_dt, LOG_FILE, sep = "\t", quote = FALSE, na = "NA")
+cat("Wrote log:", LOG_FILE, "\n")
+
+cat("Files processed OK:", sum(log_dt$status == "OK"), " / ", nrow(log_dt), "\n")
+cat("Files with before 'none' markers:", sum(log_dt$before_none > 0, na.rm = TRUE), "\n")
+cat("Files with sums not OK (should be 0):", sum(!log_dt$before_sums_ok | !log_dt$kept_sums_ok, na.rm = TRUE), "\n")
+
+
+```
+
