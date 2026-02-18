@@ -127,3 +127,26 @@
 - PARAMETER MODIFICATION: Update population manifest as needed
 - Runs over the 21 chromosomes and uses awk commands to generate outputs for per-population filtering
 ***
+**15a. thin_counts.sh:** Estimate retained marker counts under multiple within-chromosome thinning distances (per population)
+- INPUT:
+  - Population manifest used in step 14
+  - Per-population kept informative marker table generated in step 14
+- OUTPUT: Per-chromosome, and accumulator files containing chr, population, total_markers, kept_at_X threshold, for each specified threshold
+- PARAMETER MODIFICATION: minimum inter-marker distance thresholds to evaluate (e.g., 50kb, 100kb, 250kb)
+- Extracts genomic positions from marker IDs and for each threshold, compute how many markers would remain under a minimum inter-marker distance constraint using sorted positions
+
+**15b. perPopulation_thinning.sh:** Apply minimum inter-marker distance thinning to per-population parent informative marker sets (per chromosome)
+- INPUT:
+  - Population manifest used in steps 14 and 15a
+  - Per-population kept informative marker table generated in step 14
+- OUTPUT:
+  - Thinned marker table containing only the subset of kept markers passing the minimum spacing rule
+  - Per-population summary table containing marker counts before and after thinning
+- PARAMETER MODIFICATION: Default bin size to use, along with an optional specification for any populations that should use a different bin size
+- For each per-population per-chromosome input file:
+  - Extracts genomic position from marker ID
+  - Sorts by postion
+  - Keeps the first marker, and keeps each subsequent marker only if there's a minimum of bin size distance between the two markers
+***
+## Prepare input files for AlphaImpute2
+**16. merge_markers_by_chr_by_pop.Rmd:** Merge array- and sequence-based genotype matrices by chromosome
