@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-# --- AlphaImpute2 availability (match your environment) ---
+# --- Load the environment with AlphaImpute2 ---
 module load Python/3.10.4-GCCcore-11.3.0
 export PATH="$HOME/.local/bin:$PATH"   # expects ~/.local/bin/AlphaImpute2
 
@@ -17,7 +17,7 @@ export PATH="$HOME/.local/bin:$PATH"   # expects ~/.local/bin/AlphaImpute2
 ROOT="/bulk/akf/Addy/Introgression_mapping/Genotype_matrices/Merged_byPopulation/filtered_parentHomPoly"
 LIST="${ROOT}/ai2_inputs.list"
 LOCK="${LIST}.lock"
-# Build the list once, atomically, under a lock
+# Build the list once under a lock
 {
   flock -x 200
   if [[ ! -s "$LIST" ]]; then
@@ -28,7 +28,6 @@ LOCK="${LIST}.lock"
   fi
 } 200>"$LOCK"
 
-# Wait briefly if another task just created it but the FS hasn’t flushed yet
 for _ in {1..10}; do
   [[ -s "$LIST" ]] && break
   sleep 0.2
@@ -38,7 +37,6 @@ IN=$(sed -n "${SLURM_ARRAY_TASK_ID}p" "$LIST" || true)
 [[ -n "${IN:-}" ]] || { echo "No input for task ${SLURM_ARRAY_TASK_ID}"; exit 0; }
 
 # --- Parse pop & chr from the path ---
-# IN example: /.../Pop80/AI2/chr1A_Pop80.genotypes
 POP_DIR=$(basename "$(dirname "$IN")")             # AI2
 POP_ROOT=$(basename "$(dirname "$(dirname "$IN")")")  # Pop80
 POP_NUM=${POP_ROOT#Pop}                             # 80
@@ -55,7 +53,7 @@ RUN_DIR="${POP_AI2_DIR}/runs_pedOnly_l1/${CHR}"
 OUT_PREFIX="${RUN_DIR}/${CHR}"                      # yields ${RUN_DIR}/${CHR}.genotypes
 mkdir -p "$RUN_DIR"
 
-# --- Parent mapping (exactly your table) ---
+# --- Parent mapping ---
 declare -A pop_map
 pop_map["30,AB,REC"]="RP2"; pop_map["30,AB,DON"]="WE30"; pop_map["30,D,REC"]="RP2"; pop_map["30,D,DON"]="TA2"
 pop_map["32,AB,REC"]="RP2"; pop_map["32,AB,DON"]="WE32"; pop_map["32,D,REC"]="RP2"; pop_map["32,D,DON"]="TA2"
@@ -82,13 +80,13 @@ AlphaImpute2 \
   -final_peeling_threshold .1 \
 
 # --- Donor allele proportions (computed from AI2 output for this pop×chr) ---
-OUT_GENO="${RUN_DIR}/${CHR}.genotypes"   # AI2 output (no header; ID then calls)
+OUT_GENO="${RUN_DIR}/${CHR}.genotypes"
 [[ -s "$OUT_GENO" ]] || { echo "ERROR: expected AI2 output $OUT_GENO"; exit 3; }
 DP_DIR="${POP_AI2_DIR}/donor_props_l1"
 mkdir -p "$DP_DIR"
 OUT_TSV="${DP_DIR}/donor_props_${CHR}_Pop${POP_NUM}.tsv"
 
-# Normalize whitespace to tabs (in-place via temp)
+# Normalize whitespace
 tmpnorm="$(mktemp)"; trap 'rm -f "$tmpnorm"' EXIT
 awk -v OFS='\t' 'BEGIN{FS="[ \t]+"} {$1=$1}1' "$OUT_GENO" | tr -d '\r' > "$tmpnorm" && mv "$tmpnorm" "$OUT_GENO"
 
@@ -146,12 +144,11 @@ TOUCH_DIR="${DP_DIR}/.done_Pop${POP_NUM}"
 mkdir -p "$TOUCH_DIR"
 touch "${TOUCH_DIR}/.done_${CHR}"
 
-# Attempt aggregation once all 21 chromosomes for this population are done.
-# Use a simple lock directory to avoid duplicate aggregation.
+# Attempt aggregation once all 21 chromosomes for this population are done
+# Use a simple lock directory to avoid duplicate aggregation
 LOCKDIR="${DP_DIR}/.agg_lock_Pop${POP_NUM}"
 EXPECTED=21
 
-# Count .done_*; if all present, try to acquire lock and aggregate
 have_done=$(ls -1 "${TOUCH_DIR}"/.done_* 2>/dev/null | wc -l | awk "{print \$1}")
 if [[ "$have_done" -ge "$EXPECTED" ]]; then
   if mkdir "$LOCKDIR" 2>/dev/null; then
