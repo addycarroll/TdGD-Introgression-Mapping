@@ -41,7 +41,7 @@ BAD="$LOG_DIR/${BASE}_unparsable_positions.txt"
 DUPREP="$LOG_DIR/${BASE}_duplicate_positions.tsv"
 echo ">>> ${CHR} Pop${PP_NUM}"
 
-# --- Parent mapping (from your table) ---
+# --- Parent mapping (from table) ---
 # For A/B chromosomes use Donor_AB; for D chromosomes use Donor_D.
 rp=""
 don_ab=""
@@ -65,7 +65,7 @@ else
 fi
 
 # --- 1) Header renaming: KSTdGD{PP}.{id} -> WIL{PP}.{id}; RP -> rp; DONOR -> donor ---
-# Keep Marker, REF, ALT as-is.
+# Keep Marker, REF, ALT asis.
 TMP_RENAMED="$(mktemp)"
 awk -F'\t' -v OFS='\t' -v PP="$PP_NUM" -v RP_NEW="$rp" -v DON_NEW="$donor" '
   function rename_sample(x,   a){
@@ -101,7 +101,7 @@ awk -F'\t' -v OFS='\t' -v PP="$PP_NUM" -v RP_NEW="$rp" -v DON_NEW="$donor" '
   | cut -f3-
 } > "$SORTED"
 
-# Report duplicate numeric positions (not a blocker)
+# Report duplicate numeric positions
 awk -F'\t' '
   NR==1{next}
   {
@@ -160,7 +160,7 @@ awk -F'\t' -v OFS='\t' '
   ' "$SORTED"
 } > "$SNP"
 
-# --- 5) Transpose to AI2 (.genotypes), rows = individuals; first token = sample id ---
+# --- 5) Transpose to AI2 (.genotypes), rows = individuals---
 awk -f /dev/fd/3 "$NUMERIC" 3<<'AWKX' > "$AI2"
 BEGIN{ FS=OFS="\t" }
 NR==1{
