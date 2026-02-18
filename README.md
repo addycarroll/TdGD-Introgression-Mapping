@@ -150,6 +150,7 @@
 ***
 ## Prepare input files for AlphaImpute2
 **16. merge_markers_by_chr_by_pop.Rmd:** Merge array- and sequence-based genotype matrices by chromosome
+
 **16.1:**
 - INPUT:
   - Per-population array hapmap files
@@ -168,6 +169,7 @@
   - Merge by marker using a union join
   - Write merged table in chunks to manage memory
   - Detect REF/ALT conflicts and log
+
 **16.2:**
 - INPUT:
   - Merged matrices from step 16.1
@@ -183,7 +185,8 @@
   - Identify the appropriate RP and donor columns in the recalled file
   - Convert recalled marker IDs to the chr_pos format if needed
   - Intersect markers between merged and recalled data and drop overlaps unless REF/ALT labels exactly match
-  - For concordant overlaps, fill RP and DONOR genotypes when missing in the merged matrix 
+  - For concordant overlaps, fill RP and DONOR genotypes when missing in the merged matrix
+
 **16.3:**
 - INPUT: Merged and filled matrices from step 16.2
 - OUTPUT:
