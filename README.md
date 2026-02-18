@@ -201,3 +201,18 @@
   - Classify each marker by whether any parent call exists and whether any progeny call exists
   - Retain only markers where both parents are non-missing, homozygous, and polymorphic between RP and DONOR
   - Write filtered outputs and generate a log summarizing before/after counts and removal reasons
+***
+**17. AlphImp_perPopulation_prep.sh:** Prepare per-population merged per-chromosome genotype matrices for AlphaImpute2
+- INPUT:
+  - Merged array and sequence genotype matrices generated during step 16
+  - Embedded parent mapping logic indicating how to name the RP and Donor columns by population and subgenome
+- OUTPUT: For each chromosome in each population:
+  - Position sorted allele table, including REF/ALT
+  - Numeric recoded table (0/1/2/9) with REF/ALT dropped
+  - AlphaImpute2 genotype input, transposed so individuals are in rows and markers are in columns
+  - AlphaImpute2 marker map with REF/ALT
+  - QC report of any duplicated or unparsable markers
+- PARAMETER MODIFICATION: Update parent mapping manifest as needed
+- Arrays over all per-population per-chromosome files, standardized sample naming to be consistent with input pedigree file, convert to numeric format and transpose
+***
+
