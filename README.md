@@ -379,3 +379,34 @@
   - Modify centromere and plotting loci information as needed
 - Creates donor proportion/introgression segment plots similar to step 19.12, but for each WIL instead of averaged across the population
 ***
+## Nucleotide diversity between population founders 
+**20. filter_byPopulation_keepMonomorphic:** Per-population filtering of pairs of parental markers
+- INPUT:
+  - Per-chromosome matrix of parental allele calls by marker (.tsv from step 13)
+  - Population manifest denoting per-population RP and donor (headings: Population, RP, DONOR_AB, DONOR_D)
+- OUTPUT: Same outputs as step 14, but without filtering for monomorphicity between population founders
+- PARAMETER MODIFICATION: Update population manifest as needed
+- Runs over the 21 chromosomes and uses awk commands to generate outputs for per-population filtering
+***
+**21. nucleotideDiversity_parents.Rmd:** Summarize nucleotide diversity between population founders
+
+**21.1:**
+- INPUT: Per-population parental filtered files generated in step 20
+- PARAMETER MODIFICATION: Bin sizes to use and centromere positions
+- Define helper functions to parse chromosome and position information from marker IDs and summarize by 1 Mb bins the pairwise divergence between pairs of population founders
+
+**21.2:**
+- INPUT: Per-population parental filtered files generated in step 20
+- OUTPUT: Per-pop x chromosome x bin table reporting number of sites, number of sites that are divergent, and nucleotide diversity per bin
+- Applies helper functions defined in step 21.1
+
+**21.3:**
+- INPUT: Per-bin results generated in step 21.2
+- OUTPUT: Summaries per pop x chr, per pop x subgenome, and per pop x genomewide, both site weighted and site unweighted
+- Summarizes nucleotide diversity results from step 21.1 by chromosome, subgenome, and genomewide, averaging nucleotide divergence both unweighted, and weighted by the number of sites used
+
+**21.4:**
+- INPUT: Per-bin results generated in step 21.2
+- OUTPUT: Per-population plots visualizing genomewide divergence between founders, faceted by chromosome
+- Plots per bin nucleotide diveristy results by genomic position, denoting centromere positions on each chromosome facet
+***
