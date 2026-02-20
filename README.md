@@ -284,4 +284,6 @@
 - Aggregates segment rows and computes counts and length summaries
 
 **19.5:**
-  - INPUT: 
+  - INPUT: Bins and segment files from step 19.3
+  - OUTPUT: Sites per bin distributions and segment support summary
+  - Diagnostics on marker density
