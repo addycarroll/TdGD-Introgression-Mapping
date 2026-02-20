@@ -274,3 +274,13 @@
   - Compute donor proportion as the number of donor alleles divided by the number of total allels, per bin
   - Compute centered moving averages using a short- and long-range window size with corresponding thresholds to call a bin as donor if either MA passes the threshold
   - Collapse consecutive donor bins into segments
+
+**19.4:**
+- INPUT: All per-chr segment outputs from step 19.3
+- OUTPUT:
+  - Master segments table
+  - Index of empty segment files
+  - Summaries by pop x method, by pop x chr x method, and by pop x subgenome x method
+- Aggregates segment rows and computes counts and length summaries
+
+**19.5:**
