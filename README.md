@@ -259,7 +259,18 @@
   - SNP marker map (must be in the same order as the genotype columns)
 - OUTPUT:
   - Raw bin table denoting the physical boundaries of each 1 Mb bin, the count of RP and DONOR alleles in each bin, the donor proportion in each bin, and the number of sites in each bin
-  - Smoothed bin table including moving average columns and indication of whether a bin is called as DONOR
+  - Smoothed bin table including moving average (MA) columns and indication of whether a bin is called as DONOR
   - Segment table for each MA parameter set containing a list of segments by WILs, indicating segment boundaries, mean donor proportion in the segment, and mean number of sites in the bins belonging to the segment
 - PARAMETER MODIFICATION:
-  - 
+  - Bin size (set to 1 Mb)
+  - Minimum sites per bin
+  - MA smoothing/segment calling parameter sets
+    - Window sizes for centered MA
+    - Thresholds for calling a donor bin
+    - Minimum segment length
+    - Minimum required sites for a bin to be included in the MA
+- For each WIL and each 1 Mb bin:
+  - Count donor vs RP alleles (hets contribute 1 allele to each)
+  - Compute donor proportion as the number of donor alleles divided by the number of total allels, per bin
+  - Compute centered moving averages using a short- and long-range window size with corresponding thresholds to call a bin as donor if either MA passes the threshold
+  - Collapse consecutive donor bins into segments
