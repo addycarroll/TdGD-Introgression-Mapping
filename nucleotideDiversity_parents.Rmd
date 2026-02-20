@@ -1,0 +1,344 @@
+```{r}
+
+##################
+## Package loading
+##################
+
+library(data.table)
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(ggplot2)
+
+```
+
+```{r}
+
+###################
+## Helper functions
+###################
+
+# ---------- SETTINGS ----------
+KEEP_BASE <- "/bulk/akf/Addy/Introgression_mapping/Genotype_matrices/filter_byPopulation/per_population_filters_keepMonomorphic"
+OUT_BASE  <- file.path(KEEP_BASE, "parent_diversity")
+dir.create(OUT_BASE, recursive = TRUE, showWarnings = FALSE)
+
+BIN_SIZE_BP <- 1e6  # 1 Mb bins
+
+# Centromeres (Mb, Chinese Spring)
+CEN_MB <- c(
+  chr1A=211.5, chr1B=241.7, chr1D=169.7,
+  chr2A=340.9, chr2B=348.9, chr2D=266.5,
+  chr3A=318.8, chr3B=348.7, chr3D=240.5,
+  chr4A=266.1, chr4B=318.8, chr4D=185.2,
+  chr5A=253.0, chr5B=200.8, chr5D=187.6,
+  chr6A=287.1, chr6B=324.7, chr6D=215.4,
+  chr7A=361.9, chr7B=309.1, chr7D=338.2
+)
+
+# ---------- PARSERS ----------
+parse_marker <- function(marker) {
+  chrom <- sub("^(chr[0-9]+[ABD]).*$", "\\1", marker)
+  pos   <- suppressWarnings(as.numeric(sub("^.*_([0-9]+)$", "\\1", marker)))
+  data.frame(Chrom = chrom, Pos = pos, stringsAsFactors = FALSE)
+}
+
+to_hom_allele <- function(gt) {
+  gt <- gsub("\r", "", gt)
+  gt <- gsub("[ \t]", "", gt)
+  gt <- gsub("\\|", "/", gt)
+
+  if (is.na(gt) || gt == "" || gt == "." || toupper(gt) == "NA" || gt == "./.") return(NA_character_)
+
+  if (!grepl("/", gt) && nchar(gt) == 2) gt <- paste0(substr(gt,1,1), "/", substr(gt,2,2))
+
+  sp <- strsplit(gt, "/", fixed = FALSE)[[1]]
+  if (length(sp) != 2) return(NA_character_)
+  if (sp[1] == "." || sp[2] == ".") return(NA_character_)
+
+  a1 <- toupper(sp[1]); a2 <- toupper(sp[2])
+  if (a1 != a2) return(NA_character_)
+  a1
+}
+
+read_kept_one <- function(kept_file) {
+  dt <- data.table::fread(kept_file, data.table = FALSE)
+
+  if (!all(c("Marker","REF","ALT") %in% names(dt))) {
+    stop("Unexpected header in: ", kept_file)
+  }
+  if (ncol(dt) != 5) stop("Expected 5 columns in kept file: ", kept_file)
+
+  rp_name    <- names(dt)[4]
+  donor_name <- names(dt)[5]
+
+  mp <- parse_marker(dt$Marker)
+  dt$Chrom <- mp$Chrom
+  dt$Pos   <- mp$Pos
+
+  dt$RP_allele <- vapply(dt[[4]], to_hom_allele, character(1))
+  dt$DN_allele <- vapply(dt[[5]], to_hom_allele, character(1))
+
+  dt$Callable <- !is.na(dt$RP_allele) & !is.na(dt$DN_allele) & !is.na(dt$Pos)
+
+  dt$Diff <- dt$Callable & (dt$RP_allele != dt$DN_allele)
+
+  b <- basename(kept_file)
+  pop <- suppressWarnings(as.integer(sub("^chr[0-9]+[ABD]_([0-9]+).*", "\\1", b)))
+  chr <- unique(dt$Chrom)
+  if (length(chr) != 1) chr <- chr[!is.na(chr)][1]
+
+  data.frame(
+    Pop      = pop,
+    Chrom    = chr,
+    SubG     = substr(chr, 5, 5),
+    RP_ID    = rp_name,
+    Donor_ID = donor_name,
+    Marker   = dt$Marker,
+    Pos      = dt$Pos,
+    Callable = dt$Callable,
+    Diff     = dt$Diff,
+    stringsAsFactors = FALSE
+  )
+}
+
+# Compute per-bin nucleotide diversity
+pi_per_bin <- function(df, bin_size_bp = 1e6) {
+  df <- df[df$Callable, , drop = FALSE]
+  if (nrow(df) == 0) return(df[0, ])
+
+  df$BinIdx   <- 1L + floor(df$Pos / bin_size_bp)
+  df$BinStart <- (df$BinIdx - 1L) * bin_size_bp
+  df$BinEnd   <- df$BinIdx * bin_size_bp - 1L
+
+  out <- df |>
+    dplyr::group_by(Pop, Chrom, SubG, RP_ID, Donor_ID, BinIdx, BinStart, BinEnd) |>
+    dplyr::summarise(
+      N_sites = dplyr::n(),
+      N_diff  = sum(Diff),
+      Pi      = ifelse(N_sites > 0, N_diff / N_sites, NA_real_),
+      .groups = "drop"
+    )
+
+  out
+}
+
+```
+
+```{r}
+
+##########################################################
+## Run across all Pop x Chr files and write outputs
+##########################################################
+
+# Discover files
+kept_files <- list.files(
+  path = KEEP_BASE,
+  pattern = "^chr[0-9]+[ABD]_[0-9]+_kept\\.tsv$",
+  full.names = TRUE,
+  recursive = TRUE
+)
+
+if (length(kept_files) == 0) stop("No kept files found under: ", KEEP_BASE)
+
+read_kept_one_fast <- function(kept_file) {
+  dt <- data.table::fread(kept_file, data.table = FALSE)
+
+  if (ncol(dt) != 5) stop("Expected 5 columns in kept file: ", kept_file)
+
+  rp_name    <- names(dt)[4]
+  donor_name <- names(dt)[5]
+
+  # parse marker -> chrom/pos
+  mp <- parse_marker(dt$Marker)
+  chr <- mp$Chrom
+  pos <- mp$Pos
+
+  rp <- gsub("[ \t]", "", dt[[4]])
+  dn <- gsub("[ \t]", "", dt[[5]])
+  rp <- gsub("\\|", "/", rp)
+  dn <- gsub("\\|", "/", dn)
+
+  callable <- !is.na(pos) & !is.na(rp) & !is.na(dn) & rp != "" & dn != ""
+  diff <- callable & (rp != dn)
+
+  pop <- suppressWarnings(as.integer(sub("^chr[0-9]+[ABD]_([0-9]+).*", "\\1", basename(kept_file))))
+  chr_u <- unique(chr[!is.na(chr)])
+  chr_u <- if (length(chr_u)) chr_u[1] else NA_character_
+
+  data.frame(
+    Pop      = pop,
+    Chrom    = chr_u,
+    SubG     = substr(chr_u, 5, 5),
+    RP_ID    = rp_name,
+    Donor_ID = donor_name,
+    Pos      = pos,
+    Callable = callable,
+    Diff     = diff,
+    stringsAsFactors = FALSE
+  )
+}
+
+pi_per_bin_fast <- function(df, bin_size_bp = 1e6) {
+  df <- df[df$Callable, , drop = FALSE]
+  if (nrow(df) == 0) return(df[0, ])
+
+  df$BinIdx   <- 1L + floor(df$Pos / bin_size_bp)
+  df$BinStart <- (df$BinIdx - 1L) * bin_size_bp
+  df$BinEnd   <- df$BinIdx * bin_size_bp - 1L
+
+  df |>
+    dplyr::group_by(Pop, Chrom, SubG, RP_ID, Donor_ID, BinIdx, BinStart, BinEnd) |>
+    dplyr::summarise(
+      N_sites = dplyr::n(),
+      N_diff  = sum(Diff),
+      Pi      = N_diff / N_sites,
+      .groups = "drop"
+    )
+}
+
+n_cores <- max(1L, parallel::detectCores() - 1L)
+
+all_list <- parallel::mclapply(
+  kept_files,
+  FUN = function(f) {
+    df <- read_kept_one_fast(f)
+    pi_per_bin_fast(df, bin_size_bp = BIN_SIZE_BP)
+  },
+  mc.cores = n_cores
+)
+
+all_bins <- dplyr::bind_rows(all_list)
+data.table::fwrite(all_bins, file.path(OUT_BASE, "rp_donor_pi_per_bin.tsv"), sep = "\t")
+
+```
+
+```{r}
+
+#############################################################################
+## Generate summaries (chr, subgenome, genome wide, simple and site weighted)
+#############################################################################
+
+# Per-pop × chr
+sum_pop_chr <- all_bins |>
+  dplyr::group_by(Pop, Chrom, SubG, RP_ID, Donor_ID) |>
+  dplyr::summarise(
+    MeanPi_simple   = mean(Pi, na.rm = TRUE),
+    MedPi_simple    = median(Pi, na.rm = TRUE),
+    MeanPi_weighted = sum(Pi * N_sites, na.rm = TRUE) / sum(N_sites[!is.na(Pi)], na.rm = TRUE),
+    Bins_used       = sum(!is.na(Pi)),
+    Sites_total     = sum(N_sites, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Per-pop × subgenome
+sum_pop_subg <- all_bins |>
+  dplyr::group_by(Pop, SubG, RP_ID, Donor_ID) |>
+  dplyr::summarise(
+    MeanPi_simple_subg   = mean(Pi, na.rm = TRUE),
+    MedPi_simple_subg    = median(Pi, na.rm = TRUE),
+    MeanPi_weighted_subg = sum(Pi * N_sites, na.rm = TRUE) / sum(N_sites[!is.na(Pi)], na.rm = TRUE),
+    Bins_used            = sum(!is.na(Pi)),
+    Sites_total          = sum(N_sites, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Genomewide per pop
+sum_pop_gw <- all_bins |>
+  dplyr::group_by(Pop, RP_ID, Donor_ID) |>
+  dplyr::summarise(
+    MeanPi_simple_gw   = mean(Pi, na.rm = TRUE),
+    MedPi_simple_gw    = median(Pi, na.rm = TRUE),
+    MeanPi_weighted_gw = sum(Pi * N_sites, na.rm = TRUE) / sum(N_sites[!is.na(Pi)], na.rm = TRUE),
+    Bins_used          = sum(!is.na(Pi)),
+    Sites_total        = sum(N_sites, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+data.table::fwrite(sum_pop_chr,  file.path(OUT_BASE, "rp_donor_pi_by_pop_by_chr.tsv"), sep="\t")
+data.table::fwrite(sum_pop_subg, file.path(OUT_BASE, "rp_donor_pi_by_pop_by_subgenome.tsv"), sep="\t")
+data.table::fwrite(sum_pop_gw,   file.path(OUT_BASE, "rp_donor_pi_by_pop_genomewide.tsv"), sep="\t")
+
+
+```
+
+```{r}
+
+############################################
+## Plot per population with centromeres 
+############################################
+
+# Centromeres
+cen_df <- data.frame(
+  Chrom  = names(CEN_MB),
+  CEN_Mb = as.numeric(CEN_MB),
+  stringsAsFactors = FALSE
+) |>
+  dplyr::mutate(
+    SubG   = factor(substr(Chrom, 5, 5), levels = c("A","B","D")),
+    ChrNum = factor(sub("chr(\\d+)[ABD]", "\\1", Chrom), levels = as.character(1:7))
+  )
+
+plot_one_pop <- function(pop_id, out_dir = OUT_BASE) {
+  df <- all_bins |>
+    dplyr::filter(Pop == pop_id, !is.na(Pi)) |>
+    dplyr::mutate(
+      SubG     = factor(SubG, levels = c("A","B","D")),
+      ChrNum   = factor(sub("chr(\\d+)[ABD]", "\\1", Chrom), levels = as.character(1:7)),
+      BinMidMb = (BinStart + (BinEnd - BinStart)/2) / 1e6
+    )
+
+  if (nrow(df) == 0) return(invisible(NULL))
+
+  ymax <- max(df$Pi, na.rm = TRUE)
+  ymax <- ceiling((ymax + 0.001) * 1000) / 1000
+
+  p <- ggplot2::ggplot(df, ggplot2::aes(x = BinMidMb, y = Pi)) +
+    ggplot2::geom_vline(
+      data = cen_df,
+      ggplot2::aes(xintercept = CEN_Mb),
+      linewidth = 0.3, alpha = 0.7, inherit.aes = FALSE
+    ) +
+    ggplot2::geom_point(size = 0.8, alpha = 0.6) +
+    ggplot2::scale_y_continuous(
+      limits = c(0, ymax),
+      expand = ggplot2::expansion(mult = c(0, 0.02))
+    ) +
+    ggplot2::scale_x_continuous(
+      name = "Position (Mb)",
+      expand = ggplot2::expansion(mult = c(0.005, 0.01))
+    ) +
+    ggplot2::facet_grid(rows = ggplot2::vars(SubG), cols = ggplot2::vars(ChrNum), scales = "free_x") +
+    ggplot2::labs(
+      title = paste0("Pop ", pop_id, " founder diversity"),
+      y = expression("Pairwise nucleotide diversity")
+    ) +
+    ggplot2::theme_bw(base_size = 12) +
+    ggplot2::theme(
+      panel.grid.minor = ggplot2::element_blank(),
+      strip.background = ggplot2::element_rect(fill = "grey92"),
+      strip.text = ggplot2::element_text(face = "bold"),
+      plot.title = ggplot2::element_text(hjust = 0.5),
+      panel.spacing.x = grid::unit(0.6, "lines"),
+      panel.spacing.y = grid::unit(0.8, "lines")
+    )
+
+  options(bitmapType = "cairo")
+  ggplot2::ggsave(
+    filename = file.path(out_dir, sprintf("rp_donor_divergence_pop%s_points_1Mb_centromeres.png", pop_id)),
+    plot = p, width = 16, height = 6.8, dpi = 300
+  )
+  ggplot2::ggsave(
+    filename = file.path(out_dir, sprintf("rp_donor_divergence_pop%s_points_1Mb_centromeres.pdf", pop_id)),
+    plot = p, width = 16, height = 6.8
+  )
+
+  invisible(p)
+}
+
+pops <- sort(unique(all_bins$Pop))
+invisible(lapply(pops, plot_one_pop))
+
+message("✅ Wrote per-bin + summary tables and per-pop plots to: ", OUT_BASE)
+
+```
