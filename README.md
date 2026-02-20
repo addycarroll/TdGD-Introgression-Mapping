@@ -231,4 +231,35 @@
   - Compute per-individual donor contribution for each marker and divide the sum by the number of markers used*2 (allele basis)
 ***
 ## Introgression Mapping
-**19. Introgression_detect_perPop.Rmd:**
+**19. Introgression_detect_perPop.Rmd:** Summarize per-WIL introgression segments
+
+**19.1:**
+- INPUT:
+  - AlphaImpute2 output genotype matrix (per pop x chr) from step 18
+  - SNP marker map
+  - Pedigree file
+  - Embedded parent mapping table
+- OUTPUT: Console log reporting for each pop x chr, expected file paths, selected parent IDs based on chromosome and subgenome, and any missing prerequisite files
+- Iterates over pops and chrs to confirm all expected files exist to avoid downstream failures
+
+**19.2:**
+- INPUT:
+  - AlphImpute2 genotype matrices from step 18
+  - Embedded parent mapping table
+- OUTPUT:
+  - Heterozygote smoothed genotype matrices
+  - QC tables reporting number of hets before, number of hets after, and number of hets replaced
+- For each WIL:
+  - Identify heterozygotes and replace only if flanking informative markers agree on ancestry origin (RP/DONOR) - fill in parental genotypes
+  - Handles chromosome ends through using the first/last terminal informative marker to define ancestry
+
+**19.3:**
+- INPUT:
+  - Smoothed genotypes from step 19.2
+  - SNP marker map (must be in the same order as the genotype columns)
+- OUTPUT:
+  - Raw bin table denoting the physical boundaries of each 1 Mb bin, the count of RP and DONOR alleles in each bin, the donor proportion in each bin, and the number of sites in each bin
+  - Smoothed bin table including moving average columns and indication of whether a bin is called as DONOR
+  - Segment table for each MA parameter set containing a list of segments by WILs, indicating segment boundaries, mean donor proportion in the segment, and mean number of sites in the bins belonging to the segment
+- PARAMETER MODIFICATION:
+  - 
