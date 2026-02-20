@@ -297,3 +297,85 @@
   - Boxplots to visualize heterozygosity, missingness, and minor allele frequency, genome wide and on a subgenome basis
 - Computes and saves QC metrics for individual level heterozygosity and missingness, marker level MAF, heterozygosity, and missingness, and generates boxplots for these metrics
 
+**19.7:**
+- INPUT:
+  - Smoothed genotype files from step 19.2
+  - SNP marker map (must be in the same order as genotype columns)
+- OUTPUT: For each chr x pop, reports of the top markers driving heterozygosity, and heterozygosity by bin
+- PARAMETER MODIFICATION: How many markers to report for top heterozygosity, at what threshold to flag markers for excessive heterozygosity, and bin size
+- Computes per marker heterozygosity across WILs for each population, extracts top heterozygous markers, aggregates into bins to identify regional hotspots of heterozygosity
+
+**19.8:**
+- INPUT:
+  - Smoothed genotype files from step 19.2
+  - SNP marker map (must be in the same order as genotype columns)
+  - Centromere locations
+- OUTPT: Per-population plots of heterozygosity across the genome, faceted by chromosome
+- For a single population, computes marker heterozygosity across WILs and plots, faceted by chromosome with centromere lines
+
+** 19.9:**
+- INPUT:
+  - Smoothed genotype files from step 19.2
+  - Embedded parent mapping table
+- OUTPUT: Donor allele proportions per WIL x chr, per WIL x subgenome, and per population x subgenome
+- Recomputes donor allele proportions as done in step 18, after heterozygote smoothing, and reports summaries both including and excluding heterozygotes in the donor proportion calculations
+
+**19.10:**
+- INPUT:
+  - Master segments table produced in step 19.4
+  - Per WIL x subgenome file from step 19.9 is used as a list of all possible WILs in a population, since the master segments table will only include WILs with a segment
+  - Centromere locations
+- OUTPUT: Proportions of WILs with introgressions, by chromosome arm
+- Uses the master segment table to compute, for each pop x MA method x chromosome arm:
+  - The number of unique WILs with at least one introgression segment overlapping that arm
+  - The proportion of WILs with an introgression on that arm by dividing by the number of total WILs obtained from donor proportion table
+
+**19.11:**
+- INPUT:
+  - Master segments table produced in step 19.4
+  - Embedded table of chromosome lengths
+- OUTPUT:
+  - Segment summaries overall, by chromosome, by population, and by pop x chr
+  - Plots of segment lengths in Mb and as a proportion of total chromosome length, both across and within pops
+- PARAMETER MODIFICATION: MA method to use for segment identification and plotting
+- For one MA smoothing/segment calling method, summarizes introgression segment lengths in Mb and as a proportion of chromosome length, writing summary tables and generating histograms
+
+**19.12:**
+- INPUT:
+  - Bins and segments files generated in step 19.3
+  - Centromere locations
+  - Locations and names of domestication loci to plot
+- OUTPUT: Population averaged donor proportion plots with introgression segment overlay, faceted by chromosome
+- PARAMETER MODIFICATION:
+  - MA method to use to identify and plot segments
+  - Modify centromere and plotting loci information as needed
+  - Consensus segment parameters (how large the segment needs to be, how many WILs have to have the segment)
+- For a single population:
+  - Loads smoothed bin files across all chromosomes, and computes the population mean donor proportion per bin
+  - Plots mean donor proportions across chromosomes, including centromere lines, population consensus segments, and domestication loci overlays
+
+**19.13:**
+- INPUT:
+  - Bins and segments files generated in step 19.3
+  - Centromere locations
+  - Locations and names of domestication loci to plot
+- OUTPUT: Consensus segment plots summarizing segments called by each MA method
+- PARAMETER MODIFICATION:
+  - MA smoothing/segment calling methods to include on the plot, how to label them, and what colors to use for each method
+  - Modify centromere and plotting loci information as needed
+  - Consensus segment parameters (how large the segment needs to be, how many WILs have to have the segment)
+- For one population:
+  - Computes population consensus introgression segments for each MA method
+  - Plots segments, faceted by chromosome, as stacked lanes, one lane per method, with domestication loci and centromere lines
+ 
+**19.14:**
+- INPUT:
+  - Bins and segments files generated in step 19.3
+  - Centromere locations
+  - Locations and names of domestication loci to plot
+- OUTPUT: One plot per WIL of genome wide donor proportions (faceted by chromosome) with called introgression segments overlaid
+- PARAMETER MODIFICATION:
+  - MA method to use to identify and plot segments
+  - Modify centromere and plotting loci information as needed
+- Creates donor proportion/introgression segment plots similar to step 19.12, but for each WIL instead of averaged across the population
+***
