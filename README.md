@@ -284,6 +284,16 @@
 - Aggregates segment rows and computes counts and length summaries
 
 **19.5:**
-  - INPUT: Bins and segment files from step 19.3
-  - OUTPUT: Sites per bin distributions and segment support summary
-  - Diagnostics on marker density
+- INPUT: Bins and segment files from step 19.3
+- OUTPUT: Sites per bin distributions and segment support summary
+- Diagnostics on marker density
+
+**19.6:**
+- INPUT:
+  - Smoothed genotype files from step 19.2
+  - SNP marker map (must be in the same order as genotype columns)
+- OUTPUT:
+  - Heterozygosity and missingness metrics on an individual WIL basis and on a marker basis, with additional subgenome specific and genome wide summaries
+  - Boxplots to visualize heterozygosity, missingness, and minor allele frequency, genome wide and on a subgenome basis
+- Computes and saves QC metrics for individual level heterozygosity and missingness, marker level MAF, heterozygosity, and missingness, and generates boxplots for these metrics
+
