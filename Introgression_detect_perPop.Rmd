@@ -1,0 +1,3883 @@
+```{r}
+
+#########################
+## Verify file intengrity
+#########################
+
+# For every population × chromosome confirm that the prerequisite files exist:
+#   1) AlphaImpute2 imputed output: chr{CHR}.genotypes
+#   2) Marker map: chr{CHR}_Pop{POP}.markers.snp
+#   3) Pedigree: pop{POP}_ped.txt
+#   Also:
+#     - define REC/DON parent IDs based on population and subgenome (AB vs D)
+#     - optionally normalize whitespace in the AI2 .genotypes output
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(stringr)
+})
+
+# =================== EDIT ROOT IF NEEDED ===================
+# ROOT directory that contains population folders (Pop30, Pop32, ...) and then AI2 subfolders.
+ROOT_BYPOP <- "/bulk/akf/Addy/Introgression_mapping/Genotype_matrices/Merged_byPopulation/filtered_parentHomPoly"
+# ===========================================================
+
+POPS <- c(30, 32, 34, 41, 42, 46, 80)
+CHRS <- c("1A","1B","1D","2A","2B","2D","3A","3B","3D","4A","4B","4D",
+          "5A","5B","5D","6A","6B","6D","7A","7B","7D")
+
+# Parent mapping table:
+# - REC is recurrent parent label used in AI2 output
+# - DON_AB is donor label used for A/B chromosomes
+# - DON_D  is donor label used for D chromosomes
+pop_map <- data.table::data.table(
+  pop    = c(30, 32, 34, 41, 42, 46, 80),
+  REC    = c("RP2","RP2","RP2","RP1","RP1","RP1","RP1"),
+  DON_AB = c("WE30","WE32","WE34","WE41","WE42","WE46","WE80"),
+  DON_D  = c("TA2","TA2","TA2","TA2","TA2","TA2","TA1")
+)
+
+# Toggles
+DO_RUN      <- FALSE  # set TRUE to call worker_fun()
+NORMALIZE   <- TRUE   # convert whitespace in .genotypes to tabs
+STOP_ON_ERR <- FALSE  # if TRUE, stop on first missing prerequisite; else continue
+
+# Utility: subgenome key for parent selection
+subkey_for_chr <- function(chr) {
+  sg <- substr(chr, nchar(chr), nchar(chr))
+  if (sg == "D") "D" else "AB"
+}
+
+# Utility: whitespace normalization
+normalize_genotypes_file <- function(path) {
+  if (!file.exists(path)) return(FALSE)
+  x <- tryCatch(readLines(path, warn = FALSE), error = function(e) NULL)
+  if (is.null(x)) return(FALSE)
+  x <- gsub("[[:space:]]+", "\t", x, perl = TRUE)
+  x <- gsub("\r", "", x, fixed = TRUE)
+  tmp <- paste0(path, ".tmp")
+  ok <- tryCatch({ writeLines(x, tmp); TRUE }, error = function(e) FALSE)
+  if (!ok) return(FALSE)
+  ok2 <- file.rename(tmp, path)
+  if (!ok2) unlink(tmp)
+  ok2
+}
+
+# Validate prerequisites for one pop x chr
+validate_context <- function(POP, CHR) {
+  chr_tag <- paste0("chr", CHR)
+  pop_dir <- file.path(ROOT_BYPOP, sprintf("Pop%d", POP), "AI2")
+
+  # AI2 genotype output
+  geno <- file.path(pop_dir, "runs_pedOnly_l1", chr_tag, paste0(chr_tag, ".genotypes"))
+
+  # Per-pop marker maps
+  map_primary  <- file.path(pop_dir, sprintf("%s_Pop%d.markers.snp", chr_tag, POP))
+  map_fallback <- file.path(pop_dir, "snp", sprintf("%s_Pop%d.markers.snp", chr_tag, POP))
+  mapf <- if (file.exists(map_primary)) map_primary else map_fallback
+
+  # Per-pop pedigree
+  ped  <- file.path(pop_dir, sprintf("pop%d_ped.txt", POP))
+
+  subkey  <- subkey_for_chr(CHR)
+  parents <- pop_map[pop == POP]
+  rec     <- parents$REC
+  don     <- if (identical(subkey, "D")) parents$DON_D else parents$DON_AB
+
+  missing <- character(0)
+  if (!file.exists(geno)) missing <- c(missing, sprintf("(missing) %s", geno))
+  if (!file.exists(mapf)) missing <- c(missing,
+                                       sprintf("(missing) %s", map_primary),
+                                       sprintf("(missing) %s", map_fallback))
+  if (!file.exists(ped))  missing <- c(missing, sprintf("(missing) %s", ped))
+
+  list(
+    POP = POP, CHR = CHR, chr_tag = chr_tag,
+    pop_dir = pop_dir,
+    geno = geno, map = mapf, ped = ped,
+    subkey = subkey, subgenome = substr(CHR, nchar(CHR), nchar(CHR)),
+    REC = rec, DON = don,
+    missing = missing
+  )
+}
+
+# Placeholder worker
+worker_fun <- function(ctx) {
+  out_dir  <- file.path(ctx$pop_dir, "runs", ctx$chr_tag)
+  bins_out <- file.path(out_dir, sprintf("Pop%d_%s_bins.tsv", ctx$POP, ctx$chr_tag))
+  message(sprintf("[WORK] Pop%02d %s | REC=%s DON=%s -> would write: %s",
+                  ctx$POP, ctx$chr_tag, ctx$REC, ctx$DON, bins_out))
+  invisible(TRUE)
+}
+
+results <- list()
+idx <- 0L
+
+for (POP in POPS) {
+  for (CHR in CHRS) {
+    idx <- idx + 1L
+    ctx <- validate_context(POP, CHR)
+
+    message("----------------------------------------------------------------")
+    message(sprintf("[READY] Pop%02d %s (subgenome=%s, key=%s)",
+                    ctx$POP, ctx$chr_tag, ctx$subgenome, ctx$subkey))
+    message("  GENO: ", ctx$geno)
+    message("   MAP: ", ctx$map)
+    message("   PED: ", ctx$ped)
+    message(sprintf(" Parents: REC=%s  DON=%s", ctx$REC, ctx$DON))
+
+    # Missing prerequisites handling
+    if (length(ctx$missing)) {
+      message("[SKIP] Missing prerequisites:\n  - ", paste(ctx$missing, collapse = "\n  - "))
+      if (isTRUE(STOP_ON_ERR)) stop("Stopping on first missing prerequisite.")
+      results[[idx]] <- list(ctx = ctx, status = "missing")
+      next
+    }
+
+    # Normalize whitespace in AI2 genotypes (optional but recommended)
+    if (isTRUE(NORMALIZE)) {
+      ok_norm <- normalize_genotypes_file(ctx$geno)
+      if (!ok_norm) {
+        message("[WARN] could not normalize whitespace in: ", ctx$geno)
+      } else {
+        message("[OK] normalized whitespace in: ", ctx$geno)
+      }
+    }
+
+    # Execute worker (or keep as dry-run if DO_RUN <- FALSE)
+    if (isTRUE(DO_RUN)) {
+      w_ok <- tryCatch(worker_fun(ctx), error = function(e) e)
+      if (inherits(w_ok, "error")) {
+        message("[ERR] worker failed: ", conditionMessage(w_ok))
+        results[[idx]] <- list(ctx = ctx, status = "worker_error", error = conditionMessage(w_ok))
+      } else {
+        results[[idx]] <- list(ctx = ctx, status = "done")
+      }
+    } else {
+      message("[DRY] Set DO_RUN <- TRUE and customize worker_fun() to execute real work.")
+      results[[idx]] <- list(ctx = ctx, status = "dry")
+    }
+  }
+}
+
+# Compact run summary
+summary_dt <- rbindlist(lapply(results, function(x) {
+  data.table(
+    Pop = x$ctx$POP,
+    Chr = x$ctx$CHR,
+    Sub = x$ctx$subgenome,
+    REC = x$ctx$REC,
+    DON = x$ctx$DON,
+    Status = x$status
+  )
+}), fill = TRUE)
+
+print(summary_dt)
+
+```
+
+```{r}
+
+##################################################
+## Heterozygote smoothing for AI2 .genotypes files
+##################################################
+
+# Process AlphaImpute2 output to reduce long retained heterozygote runs
+# - For each WIL:
+#   Replace heterozygote runs ONLY if both flanking markers indicate the same origin (RP or DON)
+
+args <- commandArgs(trailingOnly = TRUE)
+get_arg <- function(flag, default = NULL) {
+  idx <- match(flag, args)
+  if (!is.na(idx) && idx < length(args)) return(args[idx + 1])
+  default
+}
+
+ROOT    <- get_arg("--root", "/bulk/akf/Addy/Introgression_mapping/Genotype_matrices/Merged_byPopulation/filtered_parentHomPoly")
+POP_IN  <- get_arg("--pop",  NA_character_)   # optional: single pop like "Pop30"
+CHR_IN  <- get_arg("--chr",  NA_character_)   # optional: single chr like "chr1A"
+RUN_TAG <- get_arg("--run",  "runs_pedOnly_l1")
+OUT_RUN <- get_arg("--out_run", paste0(RUN_TAG, "_smoothed"))
+
+# Parent mapping
+pop_map <- data.table::data.table(
+  pop    = c(30, 32, 34, 41, 42, 46, 80),
+  REC    = c("RP2","RP2","RP2","RP1","RP1","RP1","RP1"),
+  DON_AB = c("WE30","WE32","WE34","WE41","WE42","WE46","WE80"),
+  DON_D  = c("TA2","TA2","TA2","TA2","TA2","TA2","TA1")
+)
+
+# Helpers
+read_genotypes_dt <- function(path) {
+  dt <- data.table::fread(path, header = FALSE, sep = "\t", data.table = TRUE, fill = TRUE, showProgress = FALSE)
+  if (ncol(dt) < 2) stop("Unexpected .genotypes format (need >= 2 cols): ", path)
+  dt
+}
+
+write_genotypes_dt <- function(dt, path) {
+  dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+  data.table::fwrite(dt, file = path, sep = "\t", col.names = FALSE, quote = FALSE)
+}
+
+get_pop_num <- function(pop_name) {
+  # Pop30 -> 30
+  as.integer(sub("^Pop", "", pop_name))
+}
+
+get_subgenome_from_chr <- function(chr_name) {
+  sg <- sub("^.*([ABD])$", "\\1", chr_name)
+  if (!sg %in% c("A", "B", "D")) return(NA_character_)
+  sg
+}
+
+get_parents_for_target <- function(pop_name, chr_name, pop_map_dt) {
+  pop_num <- get_pop_num(pop_name)
+  sg <- get_subgenome_from_chr(chr_name)
+  if (is.na(pop_num) || is.na(sg)) return(list(ok = FALSE, msg = "Could not parse pop or subgenome"))
+
+  row <- pop_map_dt[pop == pop_num]
+  if (nrow(row) != 1) return(list(ok = FALSE, msg = paste0("Pop not in pop_map: ", pop_num)))
+
+  rp <- row$REC[1]
+  don <- if (sg %in% c("A", "B")) row$DON_AB[1] else row$DON_D[1]
+
+  list(ok = TRUE, rp = rp, don = don, pop_num = pop_num, subgenome = sg)
+}
+
+# Core smoothing for one .genotypes matrix
+smooth_one_dt <- function(dt, rp_id, don_id) {
+  ids <- dt[[1]]
+  rp_row  <- which(ids == rp_id)
+  don_row <- which(ids == don_id)
+
+  if (length(rp_row) != 1)  stop("RP row not found or not unique: ", rp_id)
+  if (length(don_row) != 1) stop("DON row not found or not unique: ", don_id)
+
+  G <- as.matrix(dt[, -1, with = FALSE])
+  storage.mode(G) <- "integer"
+
+  rp  <- G[rp_row, ]
+  don <- G[don_row, ]
+
+  # Define flanking markers
+  elig <- (rp %in% c(0L, 2L)) & (don %in% c(0L, 2L)) & (rp != don)
+
+  # QC table: per-individual heterozygosity before/after and how many hets were replaced
+  qc <- data.table::data.table(
+    ID = ids,
+    Het_before = NA_real_,
+    Het_after  = NA_real_,
+    Het_replaced = NA_integer_
+  )
+
+  # Helper: determine whether a given genotype value matches RP or DON at a position
+  # Returns:
+  # - 1 = matches RP genotype
+  # - 2 = matches DON genotype
+  match_parent <- function(w, rp_g, don_g) {
+    if (is.na(w) || w %in% c(1L, 9L)) return(NA_integer_)  # exclude het and missing
+    if (!is.na(rp_g)  && w == rp_g)  return(1L)
+    if (!is.na(don_g) && w == don_g) return(2L)
+    NA_integer_
+  }
+
+  if (!any(elig)) {
+    for (i in seq_len(nrow(G))) {
+      h <- mean(G[i, ] == 1L)
+      qc[i, `:=`(Het_before = h, Het_after = h, Het_replaced = 0L)]
+    }
+    return(list(dt_out = dt, qc = qc))
+  }
+
+  n_ind <- nrow(G)
+  n_mrk <- ncol(G)
+  idx_elig <- which(elig)
+
+  # iterate over all WILs
+  for (i in seq_len(n_ind)) {
+    wil <- G[i, ]
+
+    if (i == rp_row || i == don_row) {
+      h <- mean(wil == 1L)
+      qc[i, `:=`(Het_before = h, Het_after = h, Het_replaced = 0L)]
+      next
+    }
+
+    het_before <- mean(wil == 1L)
+
+    anchor_type <- rep(NA_integer_, n_mrk)
+    w_e   <- wil[idx_elig]
+    rp_e  <- rp[idx_elig]
+    don_e <- don[idx_elig]
+    anchor_type[idx_elig][w_e == rp_e]  <- 1L
+    anchor_type[idx_elig][w_e == don_e] <- 2L
+
+    # Identify heterozygote runs (value = 1)
+    is_het <- (wil == 1L)
+    if (!any(is_het)) {
+      qc[i, `:=`(Het_before = het_before, Het_after = het_before, Het_replaced = 0L)]
+      next
+    }
+
+    r <- rle(is_het)
+    ends <- cumsum(r$lengths)
+    starts <- ends - r$lengths + 1L
+
+    replaced <- 0L
+
+    for (k in seq_along(r$values)) {
+      if (!r$values[k]) next
+      a <- starts[k]
+      b <- ends[k]
+
+      if (a <= 1L || b >= n_mrk) next
+
+      # nearest anchor to left of run
+      left_candidates <- which(!is.na(anchor_type[seq_len(a - 1L)]))
+      left_anchor <- if (length(left_candidates) == 0L) NA_integer_ else left_candidates[length(left_candidates)]
+
+      # nearest anchor to right of run
+      right_candidates <- which(!is.na(anchor_type[(b + 1L):n_mrk]))
+      right_anchor <- if (length(right_candidates) == 0L) NA_integer_ else (b + right_candidates[1L])
+
+      if (is.na(left_anchor) || is.na(right_anchor)) next
+
+      lt <- anchor_type[left_anchor]
+      rt <- anchor_type[right_anchor]
+      # only smooth if both flanks exist and agree in parental origin
+      if (is.na(lt) || is.na(rt) || lt != rt) next
+
+      old <- wil[a:b]
+
+      # Fill using the chosen parent's genotype at each marker position
+      if (lt == 1L) {
+        wil[a:b] <- rp[a:b]
+      } else if (lt == 2L) {
+        wil[a:b] <- don[a:b]
+      }
+
+      replaced <- replaced + sum(old == 1L & wil[a:b] != 1L)
+    }
+
+    # accommodate chromosome ends
+    anchor_pos <- which(!is.na(anchor_type))
+    if (length(anchor_pos) > 0L) {
+      first_anchor <- anchor_pos[1L]
+      last_anchor  <- anchor_pos[length(anchor_pos)]
+
+      # left end
+      if (first_anchor > 1L) {
+        # determine whether the first marker matches RP or DON
+        left_origin <- match_parent(wil[1L], rp[1L], don[1L])
+        if (!is.na(left_origin)) {
+          if (anchor_type[first_anchor] == left_origin) {
+            idx <- 1L:(first_anchor - 1L)
+            old <- wil[idx]
+            if (left_origin == 1L) {
+              wil[idx] <- rp[idx]
+            } else {
+              wil[idx] <- don[idx]
+            }
+            replaced <- replaced + sum(old == 1L & wil[idx] != 1L)
+          }
+        }
+      }
+
+      # right end
+      if (last_anchor < n_mrk) {
+        right_origin <- match_parent(wil[n_mrk], rp[n_mrk], don[n_mrk])
+        if (!is.na(right_origin)) {
+          if (anchor_type[last_anchor] == right_origin) {
+            idx <- (last_anchor + 1L):n_mrk
+            old <- wil[idx]
+            if (right_origin == 1L) {
+              wil[idx] <- rp[idx]
+            } else {
+              wil[idx] <- don[idx]
+            }
+            replaced <- replaced + sum(old == 1L & wil[idx] != 1L)
+          }
+        }
+      }
+    }
+
+    # Write smoothed WIL back into matrix
+    G[i, ] <- wil
+    het_after <- mean(wil == 1L)
+
+    # Record QC metrics for this individual
+    qc[i, `:=`(
+      Het_before = het_before,
+      Het_after  = het_after,
+      Het_replaced = replaced
+    )]
+  }
+
+  dt_out <- data.table::copy(dt)
+  dt_out[, (2:ncol(dt_out)) := data.table::as.data.table(G)]
+  list(dt_out = dt_out, qc = qc)
+}
+
+# Identify directories
+pop_dirs <- if (!is.na(POP_IN)) {
+  file.path(ROOT, POP_IN)
+} else {
+  list.dirs(ROOT, full.names = TRUE, recursive = FALSE)
+}
+pop_dirs <- pop_dirs[grepl("/Pop[0-9]+$", pop_dirs)]
+if (length(pop_dirs) == 0) stop("No Pop* directories found under root: ", ROOT)
+
+targets <- list()
+
+for (pdir in pop_dirs) {
+  pop <- basename(pdir)
+  run_dir <- file.path(pdir, "AI2", RUN_TAG)
+  if (!dir.exists(run_dir)) next
+
+  chr_dirs <- if (!is.na(CHR_IN)) {
+    file.path(run_dir, CHR_IN)
+  } else {
+    list.dirs(run_dir, full.names = TRUE, recursive = FALSE)
+  }
+  chr_dirs <- chr_dirs[grepl("(^|/)chr", chr_dirs)]
+
+  for (cdir in chr_dirs) {
+    chr <- basename(cdir)
+    geno_file <- file.path(cdir, paste0(chr, ".genotypes"))
+    if (!file.exists(geno_file)) next
+
+    pm <- get_parents_for_target(pop, chr, pop_map)
+    if (!isTRUE(pm$ok)) {
+      warning("[", pop, " ", chr, "] Skipping (parent mapping failed): ", pm$msg)
+      next
+    }
+
+    out_file <- file.path(pdir, "AI2", OUT_RUN, chr, paste0(chr, ".genotypes"))
+    qc_file  <- file.path(pdir, "AI2", OUT_RUN, chr, paste0(chr, ".smoothing_qc.tsv"))
+
+    targets[[length(targets) + 1L]] <- list(
+      pop = pop,
+      chr = chr,
+      rp = pm$rp,
+      don = pm$don,
+      infile = geno_file,
+      outfile = out_file,
+      qcfile = qc_file
+    )
+  }
+}
+
+if (length(targets) == 0) {
+  stop("No .genotypes targets found. Check --root, --run, and optional --pop/--chr filters.")
+}
+
+message("Found ", length(targets), " target(s). Running smoothing...")
+
+# Process target directories
+qc_all <- list()
+
+for (t in targets) {
+  message("[", t$pop, " ", t$chr, "] RP=", t$rp, " DON=", t$don)
+  dt <- read_genotypes_dt(t$infile)
+
+  res <- smooth_one_dt(dt, rp_id = t$rp, don_id = t$don)
+
+  # write smoothed genotypes
+  write_genotypes_dt(res$dt_out, t$outfile)
+
+  # write per-chr QC
+  qc_dt <- data.table::copy(res$qc)
+  qc_dt[, `:=`(Pop = t$pop, Chr = t$chr, RP = t$rp, DON = t$don)]
+  data.table::setcolorder(qc_dt, c("Pop", "Chr", "RP", "DON", "ID", "Het_before", "Het_after", "Het_replaced"))
+  dir.create(dirname(t$qcfile), recursive = TRUE, showWarnings = FALSE)
+  data.table::fwrite(qc_dt, file = t$qcfile, sep = "\t", quote = FALSE)
+
+  qc_all[[length(qc_all) + 1L]] <- qc_dt
+}
+
+# Write combined QC summary
+qc_all_dt <- data.table::rbindlist(qc_all, use.names = TRUE, fill = TRUE)
+qc_summary_file <- file.path(ROOT, "AI2", paste0(OUT_RUN, "__QC_all.tsv"))
+dir.create(dirname(qc_summary_file), recursive = TRUE, showWarnings = FALSE)
+data.table::fwrite(qc_all_dt, file = qc_summary_file, sep = "\t", quote = FALSE)
+
+message("Done.")
+message("Combined QC: ", qc_summary_file)
+
+```
+
+```{r}
+
+##########################################################################################################################################
+## Build 1Mb bins of donor allele proportions per WIL and compute moving average smoothed donor proportions to call introgression segments
+##########################################################################################################################################
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(stringr)
+})
+
+# =================== EDIT ROOT IF NEEDED ===================
+ROOT_BYPOP <- "/bulk/akf/Addy/Introgression_mapping/Genotype_matrices/Merged_byPopulation/filtered_parentHomPoly"
+
+POPS <- c(30, 32, 34, 41, 42, 46, 80)
+CHRS <- c("1A","1B","1D","2A","2B","2D","3A","3B","3D","4A","4B","4D","5A","5B","5D","6A","6B","6D","7A","7B","7D")
+
+# Parent mapping (AB uses WE, D uses TA)
+pop_map <- data.table::data.table(
+  pop    = c(30, 32, 34, 41, 42, 46, 80),
+  REC    = c("RP2","RP2","RP2","RP1","RP1","RP1","RP1"),
+  DON_AB = c("WE30","WE32","WE34","WE41","WE42","WE46","WE80"),
+  DON_D  = c("TA2","TA2","TA2","TA2","TA2","TA2","TA1")
+)
+
+# ----------------- Pipeline toggles -----------------
+DO_RUN        <- TRUE   # must be TRUE to execute
+NORMALIZE     <- TRUE   # normalize whitespace in AI2 genotypes
+STOP_ON_ERR   <- TRUE
+FORCE_REBIN   <- TRUE  # if TRUE, rebuild bins even if cached file exists
+REBIN_IF_OLDER_THAN_DAYS <- NA_integer_
+
+# ----------------- Binning parameters -----------------
+BIN_SIZE_BP        <- 1e6  # 1 Mb raw bins
+MIN_SITES_PER_BIN  <- 1L   # minimum informative sites to keep bin row
+MIN_ALLELE_COUNT   <- 1L   # minimum total allele count to keep bin row
+
+# ----------------- Smoothing parameter sets -----------------
+# Each entry defines one smoothing/segment calling configuration
+# Loop over each set and write separate outputs
+PARAM_SETS <- list(
+  # Tag is derived from fields automatically, but you can add a 'label' for readability in downstream analysis
+  list(k10 = 1L,  k40 = 5L, thr10 = 0.80, thr40 = 0.60, min_seg_len_mb = 1.0, min_sites_for_ma = 1L),
+  list(k10 = 3L,  k40 = 10L, thr10 = 0.80, thr40 = 0.60, min_seg_len_mb = 1.0, min_sites_for_ma = 1L),
+  list(k10 = 5L,  k40 = 20L, thr10 = 0.80, thr40 = 0.60, min_seg_len_mb = 1.0, min_sites_for_ma = 1L),
+  list(k10 = 10L,  k40 = 30L, thr10 = 0.80, thr40 = 0.60, min_seg_len_mb = 1.0, min_sites_for_ma = 1L),  
+  list(k10 = 25L,  k40 = 50L, thr10 = 0.80, thr40 = 0.60, min_seg_len_mb = 1.0, min_sites_for_ma = 1L),   
+  list(k10 = 1L,  k40 = 5L, thr10 = 0.90, thr40 = 0.70, min_seg_len_mb = 1.0, min_sites_for_ma = 1L),
+  list(k10 = 3L,  k40 = 10L, thr10 = 0.90, thr40 = 0.70, min_seg_len_mb = 1.0, min_sites_for_ma = 1L),
+  list(k10 = 5L,  k40 = 20L, thr10 = 0.90, thr40 = 0.70, min_seg_len_mb = 1.0, min_sites_for_ma = 1L),
+  list(k10 = 10L,  k40 = 30L, thr10 = 0.90, thr40 = 0.70, min_seg_len_mb = 1.0, min_sites_for_ma = 1L),  
+  list(k10 = 25L,  k40 = 50L, thr10 = 0.90, thr40 = 0.70, min_seg_len_mb = 1.0, min_sites_for_ma = 1L)  
+)
+
+# =================== HELPERS ===================
+
+subkey_for_chr <- function(chr) {
+  sg <- substr(chr, nchar(chr), nchar(chr))
+  if (sg == "D") "D" else "AB"
+}
+
+normalize_genotypes_file <- function(path) {
+  if (!file.exists(path)) return(FALSE)
+  x <- tryCatch(readLines(path, warn = FALSE), error = function(e) NULL)
+  if (is.null(x)) return(FALSE)
+  x <- gsub("[[:space:]]+", "\t", x, perl = TRUE)
+  x <- gsub("\r", "", x, fixed = TRUE)
+  tmp <- paste0(path, ".tmp")
+  ok <- tryCatch({ writeLines(x, tmp); TRUE }, error = function(e) FALSE)
+  if (!ok) return(FALSE)
+  ok2 <- file.rename(tmp, path); if (!ok2) unlink(tmp)
+  ok2
+}
+
+validate_context <- function(POP, CHR) {
+  chr_tag <- paste0("chr", CHR)
+  pop_dir <- file.path(ROOT_BYPOP, paste0("Pop", POP), "AI2")
+
+  # AI2 output after imputation and heterozygote smoothing
+  geno_dir <- file.path(pop_dir, "runs_pedOnly_l1_smoothed", chr_tag)
+  geno     <- file.path(geno_dir, paste0(chr_tag, ".genotypes"))
+
+  # Per-pop SNP maps
+  map_primary  <- file.path(pop_dir, "snp", sprintf("%s_Pop%d.markers.snp", chr_tag, POP))
+  map_fallback <- file.path(pop_dir, "snp", sprintf("%s_Pop%d.markers.snp", chr_tag, POP))
+  mapf <- if (file.exists(map_primary)) map_primary else map_fallback
+
+  ped  <- file.path(pop_dir, sprintf("pop%d_ped.txt", POP))
+
+  subkey  <- subkey_for_chr(CHR)
+  parents <- pop_map[pop == POP]
+  rec     <- parents$REC
+  don     <- if (identical(subkey, "D")) parents$DON_D else parents$DON_AB
+
+  missing <- character(0)
+  if (!file.exists(geno)) missing <- c(missing, geno)
+  if (!file.exists(mapf)) missing <- c(missing, paste(map_primary, "or", map_fallback))
+  if (!file.exists(ped))  missing <- c(missing, ped)
+
+  list(
+    POP = POP, CHR = CHR, chr_tag = chr_tag,
+    pop_dir = pop_dir, geno_dir = geno_dir,
+    geno = geno, map = mapf, ped = ped,
+    subkey = subkey, subgenome = substr(CHR, nchar(CHR), nchar(CHR)),
+    REC = rec, DON = don,
+    missing = missing
+  )
+}
+
+# Count RP vs DON alleles for a vector of individual calls within an informative block
+# - il_vec = individual genotype calls at informative markers in one bin
+# - rp_vec = RP parent calls at same markers
+# - dn_vec = donor parent calls at same markers 
+# Return:
+# - HW = count of RP alleles in bin
+# - WE = count of donor alleles in bin
+# - n = total alleles counted
+# - sites_used = number of informative markers with nonmissing genotype for each WIL
+# Note: heterozygotes contribute 1 allele to both
+count_bin_hw_we <- function(il_vec, rp_vec, dn_vec) {
+  keep <- (il_vec != 9L)
+  if (!any(keep)) return(c(0L,0L,0L,0L))     # HW, WE, n_alleles, n_sites_used
+  il <- il_vec[keep]; rp <- rp_vec[keep]; dn <- dn_vec[keep]
+  het <- (il == 1L)
+  hw_match <- (!het) & (il == rp)
+  we_match <- (!het) & (il == dn)
+  HW <- sum(hw_match) * 2L + sum(het)
+  WE <- sum(we_match) * 2L + sum(het)
+  n  <- HW + WE
+  sites_used <- length(il)
+  c(HW, WE, n, sites_used)
+}
+
+# Centered moving average
+# For each bin, average donor allele props over bins that are present and have sites >= min_sites
+ma_centered <- function(x, sites, k, min_sites) {
+  n <- length(x)
+  out <- rep(NA_real_, n)
+  for (i in seq_len(n)) {
+    lo <- max(1L, i - k)
+    hi <- min(n,   i + k)
+    ok <- !is.na(x[lo:hi]) & sites[lo:hi] >= min_sites
+    if (any(ok)) out[i] <- mean(x[lo:hi][ok])
+  }
+  out
+}
+
+bins_out_path <- function(ctx) {
+  file.path(ctx$geno_dir, sprintf("Pop%d_%s_bins.tsv", ctx$POP, ctx$chr_tag))
+}
+
+param_tag <- function(p) {
+  sprintf("k10-%d_k40-%d_th10-%s_th40-%s",
+          as.integer(p$k10), as.integer(p$k40),
+          format(p$thr10, trim=TRUE), format(p$thr40, trim=TRUE),
+          format(p$min_seg_len_mb, trim=TRUE), as.integer(p$min_sites_for_ma))
+}
+
+# =================== Stage 1: BINNING ===================
+
+build_bins <- function(ctx) {
+  CHR <- ctx$CHR
+  POP <- ctx$POP
+
+  # Ensure output directory exists
+  if (!dir.exists(ctx$geno_dir)) dir.create(ctx$geno_dir, recursive = TRUE, showWarnings = FALSE)
+
+  # Optionally normalize whitespace
+  if (isTRUE(NORMALIZE)) {
+    ok_norm <- normalize_genotypes_file(ctx$geno)
+    if (!ok_norm) message("[WARN] could not normalize whitespace in: ", ctx$geno)
+  }
+
+  # ---- Read SNP map ----
+  # map must contain SNP_ID, Chr, Pos, A1, A2
+  # the order of the map rows must be the same as the order of the genotype columns
+  map <- tryCatch(
+    fread(ctx$map, header = TRUE, sep = "\t", quote = "", data.table = FALSE, check.names = FALSE),
+    error = function(e) stop("Failed to read map: ", ctx$map, " | ", e$message)
+  )
+  need_map <- c("SNP_ID","Chr","Pos","A1","A2")
+  if (!all(need_map %in% names(map))) {
+    stop("Map missing required columns in ", ctx$map, " -> need: ", paste(need_map, collapse = ", "))
+  }
+  pos <- as.integer(map$Pos)
+  if (anyNA(pos)) stop("Map Pos has NA for ", CHR)
+
+  # ---- Read AI2 genotypes (headerless; rows = samples, col1=ID, rest=markers) ----
+  geno <- tryCatch(
+    read.table(ctx$geno, header = FALSE, sep = "", quote = "", comment.char = "",
+               stringsAsFactors = FALSE, check.names = FALSE),
+    error = function(e) stop("Failed to read genotypes: ", ctx$geno, " | ", e$message)
+  )
+  colnames(geno)[1] <- "Sample"
+  if ((ncol(geno) - 1L) != nrow(map)) {
+    stop(sprintf("%s: marker count mismatch (geno cols-1=%d vs map n=%d).",
+                 CHR, ncol(geno)-1L, nrow(map)))
+  }
+  colnames(geno)[-1] <- map$SNP_ID
+
+  # ---- Identify parents and progeny subset ----
+  rp_row <- which(geno$Sample == ctx$REC)
+  dn_row <- which(geno$Sample == ctx$DON)
+  if (length(rp_row) != 1L) stop(CHR, ": REC not found uniquely: ", ctx$REC)
+  if (length(dn_row) != 1L) stop(CHR, ": DON not found uniquely: ", ctx$DON)
+
+  patt <- paste0("^WIL", POP, "\\.")
+  il_idx <- grep(patt, geno$Sample)
+  if (!length(il_idx)) {
+    message(sprintf("[%s Pop%02d] No WIL progeny found; skipping.", CHR, POP))
+    return(invisible(FALSE))
+  }
+
+  rp <- as.integer(unlist(geno[rp_row, -1], use.names = FALSE))
+  dn <- as.integer(unlist(geno[dn_row, -1], use.names = FALSE))
+
+  # Informative markers
+  inf <- (rp %in% c(0L,2L)) & (dn %in% c(0L,2L)) & (rp != dn) & (rp != 9L) & (dn != 9L)
+  if (!any(inf)) {
+    message(sprintf("[%s Pop%02d] No informative SNPs; skipping.", CHR, POP))
+    return(invisible(FALSE))
+  }
+
+  pos_inf <- pos[inf]
+  rp_inf  <- rp[inf]
+  dn_inf  <- dn[inf]
+
+  # ---- Define bins ----
+  max_pos <- max(pos_inf, na.rm = TRUE)
+  starts  <- seq.int(0L, max_pos, by = BIN_SIZE_BP)
+  ends    <- pmin(starts + BIN_SIZE_BP - 1L, max_pos)
+  bin_id  <- as.integer(pos_inf %/% BIN_SIZE_BP)    # 0-based bin indices
+  idx_by_bin <- split(seq_along(pos_inf), bin_id)
+
+  bins_out <- bins_out_path(ctx)
+  cat(paste(c("Acc","Chrom","Start","End","HW_count","WE_count","HW_prop","WE_prop","Sites"), collapse = "\t"),
+      "\n", file = bins_out)
+
+  # For each WIL
+  for (i in il_idx) {
+    acc   <- geno$Sample[i]
+    il    <- as.integer(unlist(geno[i, -1], use.names = FALSE))
+    il_inf <- il[inf]
+    
+    #For each bin
+    for (nm in names(idx_by_bin)) {
+      b <- as.integer(nm)
+      idx <- idx_by_bin[[nm]]
+      # Count alleles and sites in this bin for this WIL
+      res <- count_bin_hw_we(il_inf[idx], rp_inf[idx], dn_inf[idx])
+      HW <- res[1]; WE <- res[2]; n <- res[3]; nsites <- res[4]
+      if (nsites < MIN_SITES_PER_BIN) next
+      if (n      < MIN_ALLELE_COUNT)  next
+      st <- starts[b + 1L]; en <- ends[b + 1L]
+      HWp <- round(HW / n, 2); WEp <- round(WE / n, 2)
+      cat(paste(acc, CHR, st, en, HW, WE, HWp, WEp, nsites, sep = "\t"),
+          "\n", file = bins_out, append = TRUE)
+    }
+  }
+  message(sprintf("[bins] Wrote: %s", bins_out))
+  TRUE
+}
+
+# =================== Stage 2: smoothing and segment calling ===================
+
+smooth_and_segments <- function(ctx, p) {
+  bins_out <- bins_out_path(ctx)
+  if (!file.exists(bins_out)) {
+    stop("No bins file found for smoothing: ", bins_out, " (build bins first)")
+  }
+
+  bins <- tryCatch(
+    fread(bins_out, header = TRUE, sep = "\t", data.table = FALSE, check.names = FALSE),
+    error = function(e) stop("Failed to read bins_out: ", bins_out, " | ", e$message)
+  )
+  if (!nrow(bins)) {
+    message(sprintf("[smooth] No bins in %s; skipping smoothing.", bins_out))
+    return(invisible(FALSE))
+  }
+
+  bins$Start   <- as.integer(bins$Start)
+  bins$End     <- as.integer(bins$End)
+  bins$WE_prop <- as.numeric(bins$WE_prop)
+  bins$Sites   <- as.integer(bins$Sites)
+
+  # Sort & split by Acc × Chrom
+  bins <- bins[order(bins$Acc, bins$Chrom, bins$Start, bins$End), ]
+  keys <- paste(bins$Acc, bins$Chrom, sep = "||")
+  grp  <- split(seq_len(nrow(bins)), keys)
+
+  smooth_rows <- vector("list", length(grp))
+  seg_rows    <- list()
+  si <- 0L
+
+  for (nm in names(grp)) {
+    idx <- grp[[nm]]
+    g   <- bins[idx, , drop = FALSE]
+
+    WE_MA10 <- ma_centered(g$WE_prop, g$Sites, k = p$k10, min_sites = p$min_sites_for_ma)
+    WE_MA40 <- ma_centered(g$WE_prop, g$Sites, k = p$k40, min_sites = p$min_sites_for_ma)
+
+    # Bin-level donor calling rule
+    # DONOR = TRUE if either the short- or long-range window MA passes threshold
+    donor_bin <- (WE_MA10 >= p$thr10) | (WE_MA40 >= p$thr40)
+    donor_bin[is.na(donor_bin)] <- FALSE
+
+    si <- si + 1L
+    smooth_rows[[si]] <- data.frame(
+      Acc     = g$Acc,
+      Chrom   = g$Chrom,
+      Start   = g$Start,
+      End     = g$End,
+      WE_prop = g$WE_prop,
+      Sites   = g$Sites,
+      WE_MA10 = round(WE_MA10, 3),
+      WE_MA40 = round(WE_MA40, 3),
+      DONOR   = donor_bin,
+      stringsAsFactors = FALSE
+    )
+
+    # Convert consecutive donor bins to segments
+    r <- rle(donor_bin)
+    ends_r   <- cumsum(r$lengths)
+    starts_r <- c(1, head(ends_r, -1) + 1)
+
+    # For each donor segment
+    for (j in seq_along(r$values)) {
+      if (!r$values[j]) next
+      i1 <- starts_r[j]; i2 <- ends_r[j]
+      seg_start <- g$Start[i1]
+      seg_end   <- g$End[i2]
+      seg_len_mb <- (seg_end - seg_start + 1) / 1e6
+      if (seg_len_mb < p$min_seg_len_mb) next
+
+      # Mean donor proportion across bins in segment, weighted by sites so sparse bins contribute less
+      sel <- i1:i2
+      w   <- g$Sites[sel]; w[is.na(w)] <- 0L
+      wsum <- sum(w)
+      mean_we <- if (wsum > 0) sum(g$WE_prop[sel] * w, na.rm = TRUE) / wsum else NA_real_
+      mean_sites <- mean(g$Sites[sel], na.rm = TRUE)
+
+      seg_rows[[length(seg_rows) + 1L]] <- data.frame(
+        Acc       = g$Acc[1],
+        Chrom     = g$Chrom[1],
+        Start     = seg_start,
+        End       = seg_end,
+        LengthMb  = round(seg_len_mb, 3),
+        NumBins   = length(sel),
+        Mean_WE   = round(mean_we, 3),
+        MeanSites = round(mean_sites, 2),
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+
+  tag <- param_tag(p)
+  out_smooth <- file.path(ctx$geno_dir, sprintf("Pop%d_%s_bins_smooth__%s.tsv", ctx$POP, ctx$chr_tag, tag))
+  out_seg    <- file.path(ctx$geno_dir, sprintf("Pop%d_%s_segments__%s.tsv",    ctx$POP, ctx$chr_tag, tag))
+
+  smooth_df  <- do.call(rbind, smooth_rows)
+  write.table(smooth_df, out_smooth, sep = "\t", quote = FALSE, row.names = FALSE)
+  message(sprintf("[smooth] Wrote: %s", out_smooth))
+
+  if (length(seg_rows)) {
+    seg_df <- do.call(rbind, seg_rows)
+    seg_df <- seg_df[order(seg_df$Acc, seg_df$Chrom, seg_df$Start), ]
+    attr(seg_df, "params") <- p
+    write.table(seg_df, out_seg, sep = "\t", quote = FALSE, row.names = FALSE)
+  } else {
+    write.table(data.frame(Acc=character(), Chrom=character(), Start=integer(),
+                           End=integer(), LengthMb=double(), NumBins=integer(),
+                           Mean_WE=double(), MeanSites=double()),
+                out_seg, sep = "\t", quote = FALSE, row.names = FALSE)
+  }
+  message(sprintf("[segments] Wrote: %s", out_seg))
+  TRUE
+}
+
+needs_rebin <- function(path) {
+  if (!file.exists(path)) return(TRUE)
+  if (isTRUE(FORCE_REBIN)) return(TRUE)
+  if (!is.na(REBIN_IF_OLDER_THAN_DAYS)) {
+    age_days <- as.numeric(difftime(Sys.time(), file.info(path)$mtime, units = "days"))
+    if (!is.na(age_days) && (age_days > REBIN_IF_OLDER_THAN_DAYS)) return(TRUE)
+  }
+  FALSE
+}
+
+results <- list(); idx <- 0L
+for (POP in POPS) {
+  for (CHR in CHRS) {
+    idx <- idx + 1L
+    ctx <- validate_context(POP, CHR)
+
+    message("----------------------------------------------------------------")
+    message(sprintf("[READY] Pop%02d %s (subgenome=%s, key=%s)",
+                    ctx$POP, ctx$chr_tag, ctx$subgenome, ctx$subkey))
+    message("   MAP: ", ctx$map)
+    message("  GENO: ", ctx$geno)
+    message("   PED: ", ctx$ped)
+    message(sprintf(" Parents: REC=%s  DON=%s", ctx$REC, ctx$DON))
+
+    if (length(ctx$missing)) {
+      message("[SKIP] Missing prerequisites:\n  - ", paste(ctx$missing, collapse = "\n  - "))
+      if (isTRUE(STOP_ON_ERR)) stop("Stopping on first missing prerequisite.")
+      results[[idx]] <- list(ctx = ctx, status = "missing")
+      next
+    }
+
+    # 1) Build (or reuse) bins
+    bins_path <- bins_out_path(ctx)
+    if (needs_rebin(bins_path)) {
+      message(sprintf("[stage1] (re)building bins -> %s", bins_path))
+      b_ok <- tryCatch(build_bins(ctx), error = function(e) e)
+      if (inherits(b_ok, "error")) {
+        message("[ERR] build_bins failed: ", conditionMessage(b_ok))
+        results[[idx]] <- list(ctx = ctx, status = "bin_error", error = conditionMessage(b_ok))
+        if (isTRUE(STOP_ON_ERR)) stop("Stopping on bin build error.")
+        next
+      }
+    } else {
+      message(sprintf("[cache] Using existing bins: %s", bins_path))
+    }
+
+    # 2) Run smoothing/segment calling for each parameter set
+    for (p in PARAM_SETS) {
+      s_ok <- tryCatch(smooth_and_segments(ctx, p), error = function(e) e)
+      if (inherits(s_ok, "error")) {
+        message("[ERR] smoothing failed (", param_tag(p), "): ", conditionMessage(s_ok))
+        if (isTRUE(STOP_ON_ERR)) stop("Stopping on smoothing error.")
+      }
+    }
+    results[[idx]] <- list(ctx = ctx, status = "done")
+  }
+}
+
+summary_dt <- rbindlist(lapply(results, function(x) {
+  data.table(
+    Pop = x$ctx$POP,
+    Chr = x$ctx$CHR,
+    Sub = x$ctx$subgenome,
+    REC = x$ctx$REC,
+    DON = x$ctx$DON,
+    Status = x$status
+  )
+}), fill = TRUE)
+
+print(summary_dt)
+
+```
+
+```{r}
+
+#####################
+## Aggregate segments
+#####################
+
+# Collect all segment TSVs produced by smoothing and combine them into a master segment table
+# Produce an index of empty segment files
+# Generate summaries: pop x chr x method, pop x method, pop x subgenome x method
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(stringr)
+})
+
+# =================== EDIT ROOT IF NEEDED ===================
+ROOT_BYPOP <- "/bulk/akf/Addy/Introgression_mapping/Genotype_matrices/Merged_byPopulation/filtered_parentHomPoly"
+
+# Output directory for aggregated tables
+OUTDIR <- file.path(ROOT_BYPOP, "AI2_aggregates_allparams")
+dir.create(OUTDIR, showWarnings = FALSE, recursive = TRUE)
+
+# ---- HELPERS ----
+
+# Normalize chromosome labels
+norm_chr <- function(x) {
+  x <- as.character(x)
+  x <- sub("^chr", "", x, ignore.case = TRUE)
+  x
+}
+
+# Empty segments schema
+empty_seg_dt <- function() {
+  data.table(
+    Acc = character(),
+    Chrom = character(),
+    Start = integer(),
+    End = integer(),
+    LengthMb = numeric(),
+    NumBins = integer(),
+    Mean_WE = numeric(),
+    MeanSites = numeric()
+  )
+}
+
+# Discover all segments files
+seg_files <- unlist(lapply(
+  list.dirs(ROOT_BYPOP, recursive = FALSE, full.names = TRUE),
+  function(pop_dir) {
+    runs_dir <- file.path(pop_dir, "AI2", "runs_pedOnly_l1_smoothed")
+    if (!dir.exists(runs_dir)) return(character())
+
+    chr_dirs <- list.dirs(runs_dir, recursive = FALSE, full.names = TRUE)
+    unlist(lapply(chr_dirs, function(cd) {
+      list.files(
+        cd,
+        pattern = "_segments(__(.+))?\\.tsv$",
+        full.names = TRUE
+      )
+    }))
+  }
+), use.names = FALSE)
+
+if (length(seg_files) == 0L) {
+  stop("No segment files found under Pop*/AI2/runs/chr*/")
+}
+
+if (length(seg_files) == 0) {
+  stop("No segment files found under: ", ROOT_BYPOP)
+}
+
+# Parse Pop and Chr from filename
+parse_meta <- function(fp) {
+  bn <- basename(fp)
+  m <- str_match(bn, "^Pop(\\d+)_([^_]+)_segments(?:__(.+))?\\.tsv$")
+  if (!is.na(m[1,1])) {
+    Pop <- as.integer(m[1,2])
+    Chr_raw <- m[1,3]
+    Method <- ifelse(is.na(m[1,4]) || nchar(m[1,4]) == 0, "untagged", m[1,4])
+    return(list(Pop = Pop, Chr = norm_chr(Chr_raw), Method = Method))
+  }
+  Pop_guess <- as.integer(str_match(fp, "Pop(\\d+)")[,2])
+  chr_dir   <- basename(dirname(fp))
+  Chr_guess <- norm_chr(chr_dir)
+  list(Pop = Pop_guess, Chr = Chr_guess, Method = "untagged")
+}
+
+parse_method_fields <- function(Method) {
+  if (is.na(Method) || Method == "untagged") return(list())
+  parts <- strsplit(Method, "_", fixed = TRUE)[[1]]
+  out <- list()
+  for (p in parts) {
+    kv <- strsplit(p, "-", fixed = TRUE)[[1]]
+    if (length(kv) >= 2) {
+      key <- kv[1]
+      val <- paste(kv[-1], collapse = "-")  # keep decimals intact
+      out[[key]] <- val
+    }
+  }
+  out
+}
+
+safe_read_segments <- function(fp) {
+  dt <- tryCatch(
+    fread(fp, sep = "\t", header = TRUE, data.table = TRUE, na.strings = c("NA", "")),
+    error = function(e) NULL
+  )
+  if (is.null(dt)) return(empty_seg_dt())
+  need <- c("Acc","Chrom","Start","End","LengthMb","NumBins","Mean_WE","MeanSites")
+  miss <- setdiff(need, names(dt))
+  if (length(miss)) return(empty_seg_dt())
+  dt
+}
+
+# Read all segments
+pieces <- lapply(seg_files, function(fp) {
+  meta <- parse_meta(fp)
+  dt <- safe_read_segments(fp)
+
+  if (nrow(dt) == 0L) {
+    return(list(
+      data = NULL,
+      empty = data.table(SourcePath = fp, Pop = meta$Pop, Chr = meta$Chr, Method = meta$Method)
+    ))
+  }
+
+  dt[, Chrom := norm_chr(Chrom)]
+  dt[, `:=`(
+    Pop = meta$Pop,
+    Chr = meta$Chr,
+    SourcePath = fp,
+    Method = meta$Method
+  )]
+  dt[, Chrom := Chr]
+
+  mf <- parse_method_fields(meta$Method)
+  if (length(mf)) {
+    for (nm in names(mf)) dt[, (nm) := mf[[nm]] ]
+  }
+
+  list(data = dt, empty = NULL)
+})
+
+data_list  <- rbindlist(lapply(pieces, `[[`, "data"),  fill = TRUE)
+empty_list <- rbindlist(lapply(pieces, `[[`, "empty"), fill = TRUE)
+
+if (nrow(data_list) == 0L) {
+  data_list <- empty_seg_dt()[, `:=`(
+    Pop = integer(), Chr = character(), SourcePath = character(), Method = character()
+  )]
+}
+
+# Reorder columns
+base_cols <- c("Pop","Acc","Chr","Start","End","LengthMb","NumBins","Mean_WE","MeanSites","Method","SourcePath")
+parsed_cols <- setdiff(names(data_list), base_cols)
+setcolorder(data_list, c(base_cols, parsed_cols))
+
+# Write master
+master_fp <- file.path(OUTDIR, "segments_master.tsv")
+fwrite(data_list, master_fp, sep = "\t")
+
+# Write empty files index
+empty_fp <- file.path(OUTDIR, "segments_empty_files.tsv")
+if (nrow(empty_list)) {
+  setorder(empty_list, Pop, Chr, Method, SourcePath)
+  fwrite(empty_list, empty_fp, sep = "\t")
+} else {
+  fwrite(data.table(SourcePath=character(), Pop=integer(), Chr=character(), Method=character()),
+         empty_fp, sep = "\t")
+}
+
+# SUMMARY: Pop × Chr × Method
+# number of total segments; number of unique accessions; mean segment length; median segment length
+if (nrow(data_list)) {
+  seg_summary <- data_list[, .(
+    n_segments    = .N,
+    n_accessions  = uniqueN(Acc),
+    mean_len_mb   = round(mean(LengthMb, na.rm = TRUE), 3),
+    median_len_mb = round(stats::median(LengthMb, na.rm = TRUE), 3)
+  ), by = .(Pop, Chr, Method)]
+
+  setorder(seg_summary, Pop, Chr, Method)
+  fwrite(seg_summary, file.path(OUTDIR, "segments_summary_by_Pop_Chr_Method.tsv"), sep = "\t")
+} else {
+  fwrite(data.table(Pop=integer(), Chr=character(), Method=character(),
+                    n_segments=integer(), n_accessions=integer(),
+                    mean_len_mb=numeric(), median_len_mb=numeric()),
+         file.path(OUTDIR, "segments_summary_by_Pop_Chr_Method.tsv"), sep = "\t")
+}
+
+# SUMMARY: Pop × Method
+if (nrow(data_list)) {
+  seg_summary_pop <- data_list[, .(
+    n_segments    = .N,
+    n_accessions  = uniqueN(Acc),
+    mean_len_mb   = round(mean(LengthMb, na.rm = TRUE), 3),
+    median_len_mb = round(stats::median(LengthMb, na.rm = TRUE), 3)
+  ), by = .(Pop, Method)]
+  setorder(seg_summary_pop, Pop, Method)
+  fwrite(seg_summary_pop, file.path(OUTDIR, "segments_summary_by_Pop_Method.tsv"), sep = "\t")
+}
+
+# ---------- Console summary ----------
+cat("\n[OK] Wrote:\n",
+    "- MASTER: ", master_fp, "\n",
+    "- EMPTY INDEX: ", empty_fp, "\n",
+    "- SUMMARY by Pop×Chr×Method: ",
+    file.path(OUTDIR, "segments_summary_by_Pop_Chr_Method.tsv"), "\n",
+    "- (Optional) SUMMARY by Pop×Method: ",
+    file.path(OUTDIR, "segments_summary_by_Pop_Method.tsv"), "\n",
+    sep = "")
+
+# SUMMARY: Pop × Subgenome × Method
+if (nrow(data_list)) {
+
+  data_list[, Subgenome := toupper(sub(".*([ABD])$", "\\1", Chr))]
+
+  seg_summary_subg <- data_list[, .(
+    n_segments    = .N,
+    n_accessions  = uniqueN(Acc),
+    mean_len_mb   = round(mean(LengthMb, na.rm = TRUE), 3),
+    median_len_mb = round(stats::median(LengthMb, na.rm = TRUE), 3)
+  ), by = .(Pop, Subgenome, Method)]
+
+  setorder(seg_summary_subg, Pop, Subgenome, Method)
+  fwrite(
+    seg_summary_subg,
+    file.path(OUTDIR, "segments_summary_by_Pop_Subgenome_Method.tsv"),
+    sep = "\t"
+  )
+
+} else {
+
+  fwrite(
+    data.table(
+      Pop = integer(),
+      Subgenome = character(),
+      Method = character(),
+      n_segments = integer(),
+      n_accessions = integer(),
+      mean_len_mb = numeric(),
+      median_len_mb = numeric()
+    ),
+    file.path(OUTDIR, "segments_summary_by_Pop_Subgenome_Method.tsv"),
+    sep = "\t"
+  )
+}
+
+```
+
+```{r}
+
+#############################
+## Marker density diagnostics
+#############################
+
+# Distribution of sites per bin by population
+# Segment support summary across all populations
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(stringr)
+})
+
+# ===================== EDIT THESE =====================
+ROOT <- "/bulk/akf/Addy/Introgression_mapping/Genotype_matrices/Merged_byPopulation/filtered_parentHomPoly"
+POPS <- c(30, 32, 34, 41, 42, 46, 80)
+RUN_DIR <- "AI2/runs_pedOnly_l1_smoothed"
+BIN_FILE_PATTERN <- "^Pop\\d+_chr[1-7][ABD]_bins\\.tsv$"
+OUTDIR_TAG <- "sites_distribution_1Mb_bins"
+
+out_root <- file.path(ROOT, OUTDIR_TAG)
+dir.create(out_root, showWarnings = FALSE, recursive = TRUE)
+
+# Sites per bin distribution by population
+all_dists <- rbindlist(lapply(POPS, function(pop) {
+
+  pop_dir <- file.path(ROOT, sprintf("Pop%d", pop), RUN_DIR)
+
+  files <- list.files(
+    pop_dir,
+    pattern = BIN_FILE_PATTERN,
+    recursive = TRUE,
+    full.names = TRUE
+  )
+
+  if (length(files) == 0L) {
+    message(sprintf("Pop%d: no bin files found in %s", pop, pop_dir))
+    return(NULL)
+  }
+
+  bins <- rbindlist(lapply(files, function(f) {
+    dt <- fread(f)
+    setnames(dt, trimws(names(dt)))
+    dt
+  }), use.names = TRUE, fill = TRUE)
+
+  req <- c("Chrom", "Start", "End", "Sites")
+  if (!all(req %in% names(bins))) {
+    stop(sprintf(
+      "Pop%d: missing required columns. Found: %s",
+      pop, paste(names(bins), collapse = ", ")
+    ))
+  }
+
+  # Collapse bins file to one row per bin to avoid overcounting bins due to multiple WILs per bin in a file
+  bins_unique <- unique(bins[, .(Chrom, Start, End, Sites)])
+
+  bins_unique[, Pop := pop]
+
+  # Distribution of how many bins have sites = x
+  dist <- bins_unique[, .(n_bins = .N), by = .(Pop, Sites)]
+  setorder(dist, Pop, Sites)
+
+  dist
+}), use.names = TRUE, fill = TRUE)
+
+outfile <- file.path(out_root, "sites_per_bin_distribution_by_population_250kb.tsv")
+fwrite(all_dists, outfile, sep = "\t")
+
+print(all_dists)
+cat("Wrote: ", outfile, "\n", sep = "")
+
+# ===================== EDIT THESE =====================
+ROOT <- "/bulk/akf/Addy/Introgression_mapping/Genotype_matrices/Merged_byPopulation/filtered_parentHomPoly"
+POPS <- c(30, 32, 34, 41, 42, 46, 80)
+
+AI2_DIR     <- "AI2"
+RUN_PATTERN <- "^runs_.*$"   # e.g. runs_200kb, runs_250kb, etc.
+SEG_PATTERN <- "^Pop\\d+_chr[1-7][ABD]_segments__.*\\.tsv$"
+
+OUTDIR_TAG <- "segment_support_summary"
+
+out_root <- file.path(ROOT, OUTDIR_TAG)
+dir.create(out_root, showWarnings = FALSE, recursive = TRUE)
+
+# Read all segments and attach pop/thinning/MA method metadata
+all_segments <- rbindlist(lapply(POPS, function(pop) {
+
+  pop_ai2_dir <- file.path(ROOT, sprintf("Pop%d", pop), AI2_DIR)
+
+  run_dirs_all <- list.dirs(pop_ai2_dir, recursive = FALSE, full.names = TRUE)
+  run_dirs <- run_dirs_all[grepl(RUN_PATTERN, basename(run_dirs_all))]
+
+  if (length(run_dirs) == 0L) {
+    message(sprintf("Pop%d: no run directories found under %s", pop, pop_ai2_dir))
+    return(NULL)
+  }
+
+  rbindlist(lapply(run_dirs, function(run_dir) {
+
+    Thinning <- sub("^runs_", "", basename(run_dir))
+
+    files <- list.files(
+      run_dir,
+      pattern = SEG_PATTERN,
+      recursive = TRUE,
+      full.names = TRUE
+    )
+
+    if (length(files) == 0L) return(NULL)
+
+    rbindlist(lapply(files, function(f) {
+
+      dt <- fread(f)
+      setnames(dt, trimws(names(dt)))
+
+      req <- c("LengthMb", "Mean_WE", "MeanSites")
+      if (!all(req %in% names(dt))) {
+        stop(sprintf(
+          "Missing required columns in %s. Found: %s",
+          f, paste(names(dt), collapse = ", ")
+        ))
+      }
+
+      Method <- sub("^.*segments__", "", basename(f))
+      Method <- sub("\\.tsv$", "", Method)
+
+      # keep only what we need; preserve segment-level rows
+      dt_out <- dt[, .(LengthMb, Mean_WE, MeanSites)]
+      dt_out[, `:=`(Pop = pop, Thinning = Thinning, Method = Method)]
+
+      dt_out
+    }), use.names = TRUE, fill = TRUE)
+
+  }), use.names = TRUE, fill = TRUE)
+
+}), use.names = TRUE, fill = TRUE)
+
+# Summarize by Pop × Thinning × Method
+summary_final <- all_segments[, .(
+  n_segments = .N,
+
+  mean_MeanSites   = mean(MeanSites, na.rm = TRUE),
+  median_MeanSites = median(MeanSites, na.rm = TRUE),
+
+  mean_MeanWE      = mean(Mean_WE, na.rm = TRUE),
+  median_MeanWE    = median(Mean_WE, na.rm = TRUE),
+
+  mean_LengthMb    = mean(LengthMb, na.rm = TRUE),
+  median_LengthMb  = median(LengthMb, na.rm = TRUE)
+), by = .(Pop, Thinning, Method)]
+
+setorder(summary_final, Pop, Thinning, Method)
+
+outfile <- file.path(out_root, "segment_support_summary_by_pop_thinning_method.tsv")
+fwrite(summary_final, outfile, sep = "\t")
+
+print(summary_final)
+cat("Wrote: ", outfile, "\n", sep = "")
+
+```
+
+```{r}
+
+#################################
+## QC summary (hets, missingness)
+#################################
+
+# Outputs:
+# - QC_individual_metrics_genomewide: genomewide per-WIL het/missing
+# - QC_individual_summaries_genomewide: pop-level summaries of genomewide metrics
+# - QC_individual_summaries_bySubgenome: pop x subgenome summaries
+# - QC_marker_summaries: pop x subgenome marker-level summaries
+# - AI2_QC_metrics_all: R object of individual and marker metrics
+# - PNG plots
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(stringr)
+})
+
+# ===================== EDIT THESE =====================
+ROOT <- "/bulk/akf/Addy/Introgression_mapping/Genotype_matrices/Merged_byPopulation/filtered_parentHomPoly"
+POPS <- c(30, 32, 34, 41, 42, 46, 80)
+
+# Directories under PopXX/AI2/ to include 
+RUN_DIRS <- c("runs_pedOnly_l1_smoothed")
+
+OUTDIR <- file.path(ROOT, "AI2_QC_metrics_plots_smoothed_l1")
+dir.create(OUTDIR, showWarnings = FALSE, recursive = TRUE)
+
+MISSING_CODE <- 9L
+# ======================================================
+
+save_png <- function(filename, width=14, height=5, dpi=200, plot_obj) {
+  fn <- file.path(OUTDIR, filename)
+  if (requireNamespace("ragg", quietly = TRUE)) {
+    ragg::agg_png(fn, width = width, height = height, units = "in", res = dpi)
+    print(plot_obj)
+    dev.off()
+  } else {
+    grDevices::png(fn, width = width, height = height, units = "in", res = dpi, type = "cairo")
+    print(plot_obj)
+    dev.off()
+  }
+  message("Wrote: ", fn)
+}
+
+# Metrics from genotype matrix
+calc_individual_metrics <- function(G) {
+  # number of non-missing markers per WIL (denominator for Het rate)
+  n_called <- rowSums(!is.na(G))
+  # total marker columns (denominator for missingness rate)
+  n_mark   <- ncol(G)
+
+  # number of heterozygous calls per WIL among called markers
+  het_n <- rowSums(G == 1, na.rm = TRUE)
+  # number of missing calls per individual
+  miss_n <- rowSums(is.na(G))
+
+  data.table(
+    N_markers = n_mark,
+    N_called  = n_called,
+    Het_N     = het_n,
+    Miss_N    = miss_n,
+    Het       = ifelse(n_called > 0, het_n / n_called, NA_real_),
+    Missing   = ifelse(n_mark   > 0, miss_n / n_mark,  NA_real_)
+  )
+}
+
+calc_marker_metrics <- function(G) {
+  n0 <- colSums(G == 0, na.rm = TRUE)
+  n1 <- colSums(G == 1, na.rm = TRUE)
+  n2 <- colSums(G == 2, na.rm = TRUE)
+
+  n_called <- n0 + n1 + n2
+  denom <- 2 * n_called
+  alt_dose <- n1 + 2 * n2
+
+  p <- ifelse(denom > 0, alt_dose / denom, NA_real_)
+  maf <- pmin(p, 1 - p)
+
+  data.table(
+    MAF = maf,
+    Het = ifelse(n_called > 0, n1 / n_called, NA_real_),
+    Missing = colMeans(is.na(G))
+  )
+}
+
+# Find genotype files for a given pop/run
+find_geno_files <- function(pop, run_dir) {
+  base <- file.path(ROOT, paste0("Pop", pop), "AI2", run_dir)
+  if (!dir.exists(base)) return(character())
+  list.files(base, pattern = "\\.genotypes$", full.names = TRUE, recursive = TRUE)
+}
+
+# Parse subgenome from chromosome directory or filename
+infer_subgenome <- function(path) {
+  m <- str_match(path, "(chr[0-9]+[ABD])")
+  chr <- m[,2]
+  if (is.na(chr)) return(NA_character_)
+  substr(chr, nchar(chr), nchar(chr)) # A/B/D
+}
+
+theme_qc <- theme_bw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = "grey90", color = NA),
+    plot.title = element_text(hjust = 0)
+  )
+
+# Plot helpers
+plot_individual_metric_per_thinning_subg <- function(ind_dt, metric_col, ylab, title_prefix, filename_prefix) {
+  for (th in RUN_DIRS) {
+    d <- ind_dt[Thinning == th]
+    if (nrow(d) == 0) next
+
+    p <- ggplot(d, aes(x = PopNum, y = get(metric_col))) +
+      geom_boxplot(outlier.shape = NA, linewidth = 0.3) +
+      geom_point(position = position_jitter(width = 0.18, height = 0),
+                 alpha = 0.25, size = 0.5) +
+      facet_wrap(~ Subgenome, nrow = 1) +
+      scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.25)) +
+      labs(
+        x = "Population",
+        y = ylab,
+        title = paste0(title_prefix, " (Population × Subgenome): ", th)
+      ) +
+      theme_qc
+
+    save_png(paste0(filename_prefix, "_", th, ".png"),
+             width = 16, height = 4.5, dpi = 300, plot_obj = p)
+  }
+}
+
+plot_individual_metric_per_thinning_genome <- function(ind_genome, metric_col, ylab, title_prefix, filename_prefix) {
+  for (th in RUN_DIRS) {
+    d <- ind_genome[Thinning == th]
+    if (nrow(d) == 0) next
+
+    p <- ggplot(d, aes(x = PopNum, y = get(metric_col))) +
+      geom_boxplot(outlier.shape = NA, linewidth = 0.3) +
+      geom_point(position = position_jitter(width = 0.18, height = 0),
+                 alpha = 0.25, size = 0.5) +
+      scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.25)) +
+      labs(
+        x = "Population",
+        y = ylab,
+        title = paste0(title_prefix, " (Genome-wide): ", th)
+      ) +
+      theme_qc
+
+    save_png(paste0(filename_prefix, "_", th, ".png"),
+             width = 12, height = 4.5, dpi = 300, plot_obj = p)
+  }
+}
+
+plot_marker_metric_per_thinning <- function(mrk_dt, metric_col, ylab, title_prefix, filename_prefix) {
+  for (th in RUN_DIRS) {
+    d <- mrk_dt[Thinning == th]
+    if (nrow(d) == 0) next
+
+    p <- ggplot(d, aes(x = PopNum, y = get(metric_col))) +
+      geom_boxplot(outlier.shape = NA, linewidth = 0.3) +
+      facet_wrap(~ Subgenome, nrow = 1) +
+      scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.25)) +
+      labs(
+        x = "Population",
+        y = ylab,
+        title = paste0(title_prefix, " (Population × Subgenome): ", th)
+      ) +
+      theme_qc
+
+    save_png(paste0(filename_prefix, "_", th, ".png"),
+             width = 16, height = 4.5, dpi = 300, plot_obj = p)
+  }
+}
+
+# =============== MAIN LOOP ===============
+# Accumulate per-file metrics into lists then bind into two tables
+# - ind_dt: one row per WIL x chr
+# - mrk_dt: one fow per marker
+ind_all <- list()
+mrk_all <- list()
+
+for (pop in POPS) {
+  for (run_dir in RUN_DIRS) {
+    files <- find_geno_files(pop, run_dir)
+    if (length(files) == 0) next
+
+    message("Pop", pop, " / ", run_dir, " : ", length(files), " files")
+
+    for (f in files) {
+      subg <- infer_subgenome(f)
+      if (is.na(subg)) next
+
+      dt <- fread(f, header = FALSE, showProgress = FALSE)
+      ids <- dt[[1]]
+
+      # keep WIL rows only
+      keep <- grepl("^WIL", ids)
+      if (!any(keep)) next
+
+      G <- as.matrix(dt[keep, -1, with = FALSE])
+      storage.mode(G) <- "integer"
+
+      G[G == MISSING_CODE] <- NA_integer_
+
+      # per-WIL
+      ind <- calc_individual_metrics(G)
+      ind[, `:=`(
+        Pop = paste0("Pop", pop),
+        Thinning = run_dir,
+        Subgenome = subg,
+        File = basename(f),
+        ID = ids[keep]
+      )]
+      ind_all[[length(ind_all) + 1]] <- ind
+
+      # per-marker
+      mrk <- calc_marker_metrics(G)
+      mrk[, `:=`(
+        Pop = paste0("Pop", pop),
+        Thinning = run_dir,
+        Subgenome = subg,
+        File = basename(f)
+      )]
+      mrk_all[[length(mrk_all) + 1]] <- mrk
+    }
+  }
+}
+
+ind_dt <- rbindlist(ind_all, use.names = TRUE, fill = TRUE)
+mrk_dt <- rbindlist(mrk_all, use.names = TRUE, fill = TRUE)
+
+if (nrow(ind_dt) == 0) stop("No WIL rows found across genotype files. Check ROOT/RUN_DIRS/ID prefixes.")
+if (nrow(mrk_dt) == 0) warning("No marker metrics computed (mrk_dt empty).")
+
+ind_dt[, Thinning := factor(Thinning, levels = RUN_DIRS)]
+mrk_dt[, Thinning := factor(Thinning, levels = RUN_DIRS)]
+ind_dt[, Subgenome := factor(Subgenome, levels = c("A","B","D"))]
+mrk_dt[, Subgenome := factor(Subgenome, levels = c("A","B","D"))]
+
+ind_dt[, PopNum := gsub("^Pop", "", Pop)]
+mrk_dt[, PopNum := gsub("^Pop", "", Pop)]
+ind_dt[, PopNum := factor(PopNum, levels = as.character(POPS))]
+mrk_dt[, PopNum := factor(PopNum, levels = as.character(POPS))]
+
+# =============== Genome wide per-WIL metrics ===============
+# Het_genome = sum(Het_N) / sum(N_called) (not mean of per-file Het)
+# Missing_genome = sum(Miss_N) / sum(N_markers) (not mean of per-file Missing)
+ind_genome <- ind_dt[, .(
+  N_markers_genome = sum(N_markers, na.rm = TRUE),
+  N_called_genome  = sum(N_called,  na.rm = TRUE),
+  Het_N_genome     = sum(Het_N,     na.rm = TRUE),
+  Miss_N_genome    = sum(Miss_N,    na.rm = TRUE),
+  Het_genome       = {
+    denom <- sum(N_called, na.rm = TRUE)
+    ifelse(denom > 0, sum(Het_N, na.rm = TRUE) / denom, NA_real_)
+  },
+  Missing_genome   = {
+    denom <- sum(N_markers, na.rm = TRUE)
+    ifelse(denom > 0, sum(Miss_N, na.rm = TRUE) / denom, NA_real_)
+  }
+), by = .(Pop, Thinning, ID)]
+
+ind_genome[, PopNum := gsub("^Pop", "", Pop)]
+ind_genome[, PopNum := factor(PopNum, levels = as.character(POPS))]
+ind_genome[, Thinning := factor(Thinning, levels = RUN_DIRS)]
+
+# Save all metrics
+saveRDS(
+  list(
+    individual_by_subgenome = ind_dt,
+    individual_genomewide   = ind_genome,
+    marker_by_subgenome     = mrk_dt
+  ),
+  file = file.path(OUTDIR, "AI2_QC_metrics_all.rds")
+)
+
+fwrite(ind_genome, file.path(OUTDIR, "QC_individual_metrics_genomewide.tsv"), sep = "\t")
+
+# =============== SUMMARIES ===============
+# A) Per-WIL summaries by subgenome
+ind_sum_subg <- ind_dt[, .(
+  N_individuals = uniqueN(ID),
+  MeanHet = mean(Het, na.rm = TRUE),
+  SDHet   = sd(Het, na.rm = TRUE),
+  MeanMissing = mean(Missing, na.rm = TRUE),
+  SDMissing   = sd(Missing, na.rm = TRUE),
+  MeanCalledMarkers = mean(N_called, na.rm = TRUE)
+), by = .(Pop, Thinning, Subgenome)]
+
+fwrite(ind_sum_subg, file.path(OUTDIR, "QC_individual_summaries_bySubgenome.tsv"), sep = "\t")
+
+# B) Per-WIL summaries genomewide
+ind_sum_genome <- ind_genome[, .(
+  N_individuals = uniqueN(ID),
+  MeanHet_genome = mean(Het_genome, na.rm = TRUE),
+  SDHet_genome   = sd(Het_genome, na.rm = TRUE),
+  MeanMissing_genome = mean(Missing_genome, na.rm = TRUE),
+  SDMissing_genome   = sd(Missing_genome, na.rm = TRUE),
+  MeanCalledMarkers_genome = mean(N_called_genome, na.rm = TRUE)
+), by = .(Pop, Thinning)]
+
+fwrite(ind_sum_genome, file.path(OUTDIR, "QC_individual_summaries_genomewide.tsv"), sep = "\t")
+
+# C) Per-marker summaries
+mrk_sum <- mrk_dt[, .(
+  N_markers = .N,
+  MeanMAF = mean(MAF, na.rm = TRUE),
+  SDMAF   = sd(MAF, na.rm = TRUE),
+  MeanHet = mean(Het, na.rm = TRUE),
+  SDHet   = sd(Het, na.rm = TRUE),
+  MeanMissing = mean(Missing, na.rm = TRUE),
+  SDMissing   = sd(Missing, na.rm = TRUE)
+), by = .(Pop, Thinning, Subgenome)]
+
+fwrite(mrk_sum, file.path(OUTDIR, "QC_marker_summaries.tsv"), sep = "\t")
+
+# =============== PLOTS ===============
+# 1) Subgenome-specific
+plot_individual_metric_per_thinning_subg(
+  ind_dt          = ind_dt,
+  metric_col      = "Het",
+  ylab            = "Het rate (per individual)",
+  title_prefix    = "Individual Heterozygosity",
+  filename_prefix = "boxplot_individual_heterozygosity_bySubgenome"
+)
+
+plot_individual_metric_per_thinning_subg(
+  ind_dt          = ind_dt,
+  metric_col      = "Missing",
+  ylab            = "Missing rate (per individual)",
+  title_prefix    = "Individual Missingness",
+  filename_prefix = "boxplot_individual_missingness_bySubgenome"
+)
+
+# 2) Genome-wide
+plot_individual_metric_per_thinning_genome(
+  ind_genome      = ind_genome,
+  metric_col      = "Het_genome",
+  ylab            = "Het rate (genome-wide per individual)",
+  title_prefix    = "Individual Heterozygosity",
+  filename_prefix = "boxplot_individual_heterozygosity_genomewide"
+)
+
+plot_individual_metric_per_thinning_genome(
+  ind_genome      = ind_genome,
+  metric_col      = "Missing_genome",
+  ylab            = "Missing rate (genome-wide per individual)",
+  title_prefix    = "Individual Missingness",
+  filename_prefix = "boxplot_individual_missingness_genomewide"
+)
+
+# 3) Marker-level plots
+plot_marker_metric_per_thinning(
+  mrk_dt          = mrk_dt,
+  metric_col      = "MAF",
+  ylab            = "MAF (per marker)",
+  title_prefix    = "Marker Minor Allele Frequency",
+  filename_prefix = "boxplot_marker_maf"
+)
+
+plot_marker_metric_per_thinning(
+  mrk_dt          = mrk_dt,
+  metric_col      = "Het",
+  ylab            = "Het (per marker)",
+  title_prefix    = "Marker Heterozygosity",
+  filename_prefix = "boxplot_marker_heterozygosity"
+)
+
+plot_marker_metric_per_thinning(
+  mrk_dt          = mrk_dt,
+  metric_col      = "Missing",
+  ylab            = "Missing (per marker)",
+  title_prefix    = "Marker Missingness",
+  filename_prefix = "boxplot_marker_missingness"
+)
+
+message("[DONE] Outputs written to: ", OUTDIR)
+message(" - QC_individual_metrics_genomewide.tsv (use this for filtering)")
+message(" - QC_individual_summaries_genomewide.tsv")
+message(" - QC_individual_summaries_bySubgenome.tsv")
+message(" - QC_marker_summaries.tsv")
+message(" - AI2_QC_metrics_all.rds")
+
+# Marker-level table with SNP metadata + Het + MAF
+
+# Location of per-chr SNP map files
+SNP_SUBDIR <- "snp"
+GENO_RUN_FOR_TABLE <- "runs_pedOnly_l1_smoothed"
+OUT_MARKER_TABLE <- file.path(
+  OUTDIR,
+  paste0("marker_metrics_with_map_", GENO_RUN_FOR_TABLE, ".tsv")
+)
+
+# HELPER: load all SNP maps for one population
+read_all_snp_maps_for_pop <- function(pop) {
+  snp_dir <- file.path(ROOT, paste0("Pop", pop), "AI2", SNP_SUBDIR)
+  if (!dir.exists(snp_dir)) return(NULL)
+
+  snp_files <- list.files(snp_dir, pattern = "\\.markers\\.snp$", full.names = TRUE)
+  if (length(snp_files) == 0) return(NULL)
+
+  maps <- lapply(snp_files, function(sf) {
+    m <- fread(sf, showProgress = FALSE)
+    
+    if (!all(c("SNP_ID","Chr","Pos") %in% names(m))) {
+      stop("SNP map missing required cols (SNP_ID, Chr, Pos): ", sf)
+    }
+    m[, `:=`(
+      Pop = paste0("Pop", pop),
+      PopNum = as.character(pop)
+    )]
+    m
+  })
+
+  rbindlist(maps, use.names = TRUE, fill = TRUE)
+}
+
+# Build a marker index inside mrk_dt
+# This relies on the fact that marker order in the .genotypes matches SNP map order
+mrk_for_run <- mrk_dt[Thinning == GENO_RUN_FOR_TABLE]
+if (nrow(mrk_for_run) == 0) stop("No marker metrics found for Thinning=", GENO_RUN_FOR_TABLE)
+
+mrk_for_run <- copy(mrk_for_run)
+mrk_for_run[, MarkerIndex := seq_len(.N), by = .(Pop, File)]
+mrk_for_run[, Chr := sub("\\.genotypes$", "", File)]
+
+# Load SNP maps for all pops and attach marker index
+snp_maps_all <- rbindlist(
+  lapply(POPS, read_all_snp_maps_for_pop),
+  use.names = TRUE, fill = TRUE
+)
+
+if (is.null(snp_maps_all) || nrow(snp_maps_all) == 0) {
+  stop("No SNP map files found under PopXX/AI2/", SNP_SUBDIR, " for POPS.")
+}
+
+snp_maps_all[, MarkerIndex := seq_len(.N), by = .(Pop, Chr)]
+
+# Merge SNP metadata with marker metrics
+marker_table <- merge(
+  snp_maps_all,
+  mrk_for_run,
+  by = c("Pop", "Chr", "MarkerIndex"),
+  all.x = TRUE,
+  all.y = FALSE
+)
+
+keep_cols <- intersect(
+  c("Pop","PopNum","Chr","Pos","SNP_ID","A1","A2",
+    "Subgenome","Thinning","File","MarkerIndex",
+    "MAF","Het","Missing"),
+  names(marker_table)
+)
+
+marker_table <- marker_table[, ..keep_cols]
+
+marker_table[, Matched := !is.na(Het)]
+message("[ADD-ON] Marker table rows: ", nrow(marker_table))
+message("[ADD-ON] Matched to metrics: ", sum(marker_table$Matched), " (",
+        round(100 * mean(marker_table$Matched), 2), "%)")
+
+# write table
+fwrite(marker_table, OUT_MARKER_TABLE, sep = "\t")
+message("[ADD-ON] Wrote: ", OUT_MARKER_TABLE)
+
+# Optional (uncomment):  write a problem markers subset for inspection
+# hihet <- marker_table[!is.na(Het) & Het >= 0.5]
+# fwrite(hihet, file.path(OUTDIR, paste0("marker_hihet_", GENO_RUN_FOR_TABLE, ".tsv")), sep="\t")
+
+
+```
+
+```{r}
+
+##############################################
+## Identify drivers of residual heterozygosity
+##############################################
+
+# Quantify per-marker heterozygosity and missingness, markers with highest heterozygosity per chr, bin level summaries of het/miss along the chromosome
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(stringr)
+})
+
+# ===================== EDIT =====================
+ROOT <- "/bulk/akf/Addy/Introgression_mapping/Genotype_matrices/Merged_byPopulation/filtered_parentHomPoly"
+POPS <- c(30,32,34,41,42,46,80)
+
+RUNS <- c("runs_pedOnly_l1_smoothed")
+SNP_DIR_FROM_RUN <- function(run) sub("^runs", "snp", run)
+
+# Marker QC thresholds used for top markers outputs
+TOP_N_MARKERS <- 200L
+HET_FLAG      <- 0.25   # adjust if desired
+BIN_SIZE_BP   <- 1e6    # 1 Mb bins
+
+OUTDIR <- file.path(ROOT, "AI2_het_drivers_marker_region_qc")
+dir.create(OUTDIR, showWarnings = FALSE, recursive = TRUE)
+
+# ---------- HELPERS ----------
+infer_chr <- function(path) str_match(path, "(chr[1-7][ABD])")[,2]
+
+read_snp_map <- function(f_snp, chr_fallback = NA_character_) {
+  if (!file.exists(f_snp)) stop("Missing SNP map: ", f_snp)
+
+  dt <- fread(f_snp, header = TRUE, sep = "\t", data.table = TRUE, showProgress = FALSE)
+  if (ncol(dt) == 1L) {
+    dt <- fread(f_snp, header = FALSE, sep = "", data.table = TRUE, showProgress = FALSE)
+  }
+
+  nms <- names(dt)
+  nms_low <- tolower(nms)
+
+  pick <- function(cands) {
+    idx <- match(tolower(cands), nms_low)
+    idx <- idx[!is.na(idx)]
+    if (length(idx)) nms[idx[1]] else NA_character_
+  }
+
+  col_marker <- pick(c("marker","snp","rsid","id","name"))
+  col_chr    <- pick(c("chr","chrom","chromosome"))
+  col_pos    <- pick(c("pos","bp","position","physical_position","physpos"))
+
+  if (is.na(col_marker) || is.na(col_pos)) {
+    if (all(grepl("^V[0-9]+$", names(dt)))) {
+      setnames(dt, names(dt), paste0("V", seq_len(ncol(dt))))
+    }
+    if (ncol(dt) >= 3L) {
+      col_marker <- if (is.na(col_marker)) names(dt)[1] else col_marker
+      col_chr    <- if (is.na(col_chr))    names(dt)[2] else col_chr
+      col_pos    <- if (is.na(col_pos))    names(dt)[3] else col_pos
+    } else {
+      stop("Cannot parse SNP map columns (need >=3 cols): ", f_snp)
+    }
+  }
+
+  out <- data.table(
+    Marker = as.character(dt[[col_marker]]),
+    Chr    = if (!is.na(col_chr)) as.character(dt[[col_chr]]) else chr_fallback,
+    Pos    = suppressWarnings(as.integer(dt[[col_pos]]))
+  )
+
+  out[, MarkerIndex := .I]
+  out
+}
+
+# Compute per-marker het/missingness on WIL rows only
+marker_metrics_from_geno <- function(Gwil) {
+  if (!is.matrix(Gwil)) Gwil <- as.matrix(Gwil)
+  if (nrow(Gwil) < 1L || ncol(Gwil) < 1L) return(NULL)
+
+  called <- !is.na(Gwil) & ((Gwil == 0L) | (Gwil == 1L) | (Gwil == 2L))
+  n_called <- colSums(called)
+
+  # genotype class counts across WILs
+  n1 <- colSums(Gwil == 1L, na.rm = TRUE)
+  n0 <- colSums(Gwil == 0L, na.rm = TRUE)
+  n2 <- colSums(Gwil == 2L, na.rm = TRUE)
+
+  # total WILs per marker
+  n_total <- ncol(Gwil) * 0L
+  n_total <- rep.int(nrow(Gwil), ncol(Gwil))
+  n_na <- n_total - (n0 + n1 + n2)
+
+  # het rate among called genotypes; missing rate among all WILs
+  het_rate  <- ifelse(n_called > 0, n1 / n_called, NA_real_)
+  miss_rate <- ifelse(n_total > 0, n_na / n_total, NA_real_)
+
+  data.table(
+    MarkerIndex = seq_len(ncol(Gwil)),
+    N0 = n0, N1 = n1, N2 = n2,
+    Ncalled = n_called,
+    Nmissing = n_na,
+    HetRate = het_rate,
+    MissRate = miss_rate
+  )
+}
+
+# Find genotype files
+find_geno_files <- function(pop, run) {
+  base <- file.path(ROOT, paste0("Pop", pop), "AI2", run)
+  if (!dir.exists(base)) return(character())
+  list.files(base, pattern = "\\.genotypes$", full.names = TRUE, recursive = TRUE)
+}
+
+snp_map_path <- function(pop, run, chr) {
+  snp_dir <- file.path(ROOT, paste0("Pop", pop), "AI2", SNP_DIR_FROM_RUN(run))
+  file.path(snp_dir, paste0(chr, "_Pop", pop, ".markers.snp"))
+}
+
+# ---------- Main ----------
+all_marker_qc <- list()
+all_bin_qc    <- list()
+all_top_qc    <- list()
+
+for (pop in POPS) {
+  for (run in RUNS) {
+    geno_files <- find_geno_files(pop, run)
+    if (!length(geno_files)) next
+    message("Pop", pop, " / ", run, " : ", length(geno_files), " genotype files")
+
+    for (fg in geno_files) {
+      chr <- infer_chr(fg)
+      if (is.na(chr)) next
+
+      # Read genotype file
+      dt <- fread(fg, header = FALSE, showProgress = FALSE)
+      ids <- dt[[1]]
+
+      wil_idx <- grepl(paste0("^WIL", pop, "\\."), ids)
+      if (!any(wil_idx)) next
+
+      # Genotype matrix
+      G <- as.matrix(dt[wil_idx, -1, with = FALSE])
+      storage.mode(G) <- "integer"
+      G[G == 9L] <- NA_integer_
+
+      if (!is.matrix(G)) G <- as.matrix(G)
+
+      # Compute per-marker het/missingness on WILs
+      mm <- marker_metrics_from_geno(G)
+      if (is.null(mm)) next
+
+      # Attach SNP map by marker index
+      fsnp <- snp_map_path(pop, run, chr)
+      smap <- read_snp_map(fsnp, chr_fallback = chr)
+
+      nG <- ncol(G)
+      nM <- nrow(smap)
+      if (nG != nM) {
+        warning("Marker count mismatch: ", basename(fg),
+                " | genotypes ncol=", nG, " | snp map nrow=", nM,
+                " | using min(n) to merge.")
+        nmin <- min(nG, nM)
+        mm   <- mm[MarkerIndex <= nmin]
+        smap <- smap[MarkerIndex <= nmin]
+      }
+
+      qc <- cbind(mm, smap[, .(Marker, Chr, Pos)])
+      qc[, `:=`(
+        Pop = paste0("Pop", pop),
+        Thinning = run,
+        GenoFile = basename(fg),
+        Chr_file = chr,
+        Subgenome = substr(chr, nchar(chr), nchar(chr))
+      )]
+
+      # Write per-file marker QC
+      out_marker_dir <- file.path(OUTDIR, "per_file_marker_qc", paste0("Pop", pop), run, chr)
+      dir.create(out_marker_dir, showWarnings = FALSE, recursive = TRUE)
+
+      fwrite(qc,
+             file.path(out_marker_dir, paste0(chr, "_Pop", pop, "_marker_qc.tsv")),
+             sep = "\t")
+
+      # Top-het markers per file
+      top <- qc[order(-HetRate)][1:min(TOP_N_MARKERS, .N)]
+      fwrite(top,
+             file.path(out_marker_dir, paste0(chr, "_Pop", pop, "_topHet_markers.tsv")),
+             sep = "\t")
+
+      # Bin by position (1 Mb bins)
+      if (!all(is.na(qc$Pos))) {
+        qc[, BinStart := as.integer(floor(Pos / BIN_SIZE_BP) * BIN_SIZE_BP)]
+        # Bin-level summaries
+        # - MeanHet / MeanMiss: average marker het/miss in the bin
+        # - FracHet_gt_flag: fraction of markers with HetRate > HET_FLAG
+        bins <- qc[, .(
+          N_markers = .N,
+          MeanHet = mean(HetRate, na.rm = TRUE),
+          MeanMiss = mean(MissRate, na.rm = TRUE),
+          FracHet_gt_flag = mean(HetRate > HET_FLAG, na.rm = TRUE)
+        ), by = .(Pop, Thinning, Chr_file, Subgenome, BinStart)][order(Pop, Thinning, Chr_file, BinStart)]
+
+        fwrite(bins,
+               file.path(out_marker_dir, paste0(chr, "_Pop", pop, "_het_bins_", as.integer(BIN_SIZE_BP), "bp.tsv")),
+               sep = "\t")
+
+        all_bin_qc[[length(all_bin_qc) + 1L]] <- bins
+      }
+
+      all_marker_qc[[length(all_marker_qc) + 1L]] <- qc
+      all_top_qc[[length(all_top_qc) + 1L]] <- top
+    }
+  }
+}
+
+marker_all <- rbindlist(all_marker_qc, use.names = TRUE, fill = TRUE)
+bins_all   <- rbindlist(all_bin_qc,    use.names = TRUE, fill = TRUE)
+top_all    <- rbindlist(all_top_qc,    use.names = TRUE, fill = TRUE)
+
+fwrite(marker_all, file.path(OUTDIR, "ALL_marker_qc.tsv"), sep = "\t")
+if (nrow(bins_all)) fwrite(bins_all, file.path(OUTDIR, "ALL_het_bins.tsv"), sep = "\t")
+fwrite(top_all, file.path(OUTDIR, "ALL_topHet_markers.tsv"), sep = "\t")
+
+worst_summary <- marker_all[, .(
+  N_markers = .N,
+  MeanHet = mean(HetRate, na.rm = TRUE),
+  P99Het  = quantile(HetRate, probs = 0.99, na.rm = TRUE, names = FALSE),
+  N_Het_gt_flag = sum(HetRate > HET_FLAG, na.rm = TRUE)
+), by = .(Pop, Thinning, Subgenome)][order(Pop, Thinning, Subgenome)]
+
+fwrite(worst_summary, file.path(OUTDIR, "SUMMARY_marker_het_overview.tsv"), sep = "\t")
+
+message("DONE. Outputs written under: ", OUTDIR)
+
+```
+
+```{r}
+
+#####################################
+## Population averaged heterozygosity
+#####################################
+
+# For each population, plot genome wide marker level heterozygosity, faceted by chromosome
+
+# ================= EDIT THESE =================
+ROOT_BYPOP <- "/bulk/akf/Addy/Introgression_mapping/Genotype_matrices/Merged_byPopulation/filtered_parentHomPoly"
+POP        <- 34
+RUNS_TAG   <- "runs_pedOnly_l1_smoothed"
+SNP_TAG    <- "snp"    # corresponding marker map folder
+
+OUT_DIR  <- file.path(ROOT_BYPOP, sprintf("Pop%d", POP), "AI2", "plots_population", RUNS_TAG)
+FILETYPE <- "png" 
+WIDTH    <- 14
+HEIGHT   <- 8
+DPI      <- 300
+
+DRAW_TILES <- TRUE
+
+CHRS <- c("chr1A","chr1B","chr1D",
+          "chr2A","chr2B","chr2D",
+          "chr3A","chr3B","chr3D",
+          "chr4A","chr4B","chr4D",
+          "chr5A","chr5B","chr5D",
+          "chr6A","chr6B","chr6D",
+          "chr7A","chr7B","chr7D")
+
+CEN_MB <- c(
+  chr1A=211.5, chr1B=241.7, chr1D=169.7,
+  chr2A=340.9, chr2B=348.9, chr2D=266.5,
+  chr3A=318.8, chr3B=348.7, chr3D=240.5,
+  chr4A=266.1, chr4B=318.8, chr4D=185.2,
+  chr5A=253.0, chr5B=200.8, chr5D=187.6,
+  chr6A=287.1, chr6B=324.7, chr6D=215.4,
+  chr7A=361.9, chr7B=309.1, chr7D=338.2
+)
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(RColorBrewer)
+})
+
+POP_DIR  <- file.path(ROOT_BYPOP, sprintf("Pop%d", POP), "AI2")
+RUNS_DIR <- file.path(POP_DIR, RUNS_TAG)
+SNP_DIR  <- file.path(POP_DIR, SNP_TAG)
+
+if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+save_plot <- function(p, out_path) {
+  if (tolower(FILETYPE) == "png") {
+    ggsave(out_path, p, width = WIDTH, height = HEIGHT, dpi = DPI, device = "png", limitsize = FALSE)
+  } else {
+    ggsave(out_path, p, width = WIDTH, height = HEIGHT, device = "pdf", limitsize = FALSE)
+  }
+}
+
+# Rread marker map: must contain a physical position column (bp)
+read_markers_map <- function(f) {
+  m <- fread(f, sep = "\t", header = TRUE, data.table = TRUE, showProgress = FALSE)
+
+  pos_col <- intersect(names(m), c("Pos", "POS", "pos", "Position", "BP", "bp", "PhysicalPosition", "physical_position"))
+  if (length(pos_col) < 1) {
+    stop("Could not find a position column in: ", f, "\nColumns: ", paste(names(m), collapse = ", "))
+  }
+  if (pos_col[1] != "pos_bp") setnames(m, pos_col[1], "pos_bp")
+
+  m[, pos_bp := as.numeric(pos_bp)]
+  m
+}
+
+# Compute marker-level mean het for this chromosome
+compute_chr_marker_mean_het <- function(chr) {
+
+  geno_file <- file.path(RUNS_DIR, chr, sprintf("%s.genotypes", chr))
+  map_file  <- file.path(SNP_DIR,  sprintf("%s_Pop%d.markers.snp", chr, POP))
+
+  if (!file.exists(geno_file)) return(NULL)
+  if (!file.exists(map_file))  stop("Missing SNP map for ", chr, ": ", map_file)
+
+  G <- fread(geno_file, sep = "\t", header = FALSE, data.table = TRUE, showProgress = FALSE)
+
+  wil_pat <- paste0("^WIL", POP, "\\.")
+  G <- G[grepl(wil_pat, V1)]
+  if (!nrow(G)) return(NULL)
+
+  X <- as.matrix(G[, -1])
+
+  callable <- (X == 0L) | (X == 1L) | (X == 2L)
+  het      <- (X == 1L)
+
+  n_call <- colSums(callable)
+  n_het  <- colSums(het)
+  mean_het <- ifelse(n_call > 0, n_het / n_call, NA_real_)
+
+  M <- read_markers_map(map_file)
+
+  if (nrow(M) != length(mean_het)) {
+    stop(
+      "Marker count mismatch for ", chr, " Pop", POP, "\n",
+      "  map rows: ", nrow(M), "\n",
+      "  genotype marker cols: ", length(mean_het), "\n",
+      "Map file: ", map_file, "\nGeno file: ", geno_file
+    )
+  }
+
+  dt <- data.table(
+    Chrom = chr,
+    pos_bp = M$pos_bp,
+    PositionMb = M$pos_bp / 1e6,
+    HetMean = pmin(1, pmax(0, mean_het)),
+    N_called = n_call
+  )
+
+  setorder(dt, pos_bp)
+
+  if (isTRUE(DRAW_TILES)) {
+    x <- dt$PositionMb
+    if (length(x) >= 2) {
+      mid <- (x[-1] + x[-length(x)]) / 2
+      xmin <- c(x[1] - (mid[1] - x[1]), mid)
+      xmax <- c(mid, x[length(x)] + (x[length(x)] - mid[length(mid)]))
+      dt[, `:=`(xmin = xmin, xmax = xmax)]
+    } else {
+      dt[, `:=`(xmin = x - 0.01, xmax = x + 0.01)]
+    }
+    dt[, `:=`(ymin = 0, ymax = 1)]
+  }
+
+  max_called <- max(dt$N_called, na.rm = TRUE)
+  if (is.finite(max_called) && max_called > 0) {
+    dt[, alpha := 0.25 + 0.75 * (N_called / max_called)]
+  } else {
+    dt[, alpha := 1]
+  }
+
+  dt[]
+}
+
+# Collect all chromosomes
+dt_list <- lapply(CHRS, compute_chr_marker_mean_het)
+dt_all  <- rbindlist(dt_list, use.names = TRUE, fill = TRUE)
+
+if (!nrow(dt_all)) stop("No genotype/map data found for Pop", POP, " under ", RUNS_DIR)
+
+dt_all[, Chrom := factor(Chrom, levels = CHRS)]
+
+# Centromeres
+cen_df <- data.frame(
+  Chrom = factor(names(CEN_MB), levels = CHRS),
+  CenMb = as.numeric(CEN_MB),
+  stringsAsFactors = FALSE
+)
+
+pal <- brewer.pal(8, "Dark2")
+col_cen <- pal[4]
+
+# Plot
+p <- ggplot() +
+  (if (isTRUE(DRAW_TILES))
+     geom_rect(
+       data = dt_all,
+       aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax,
+           fill = HetMean, alpha = alpha),
+       color = NA
+     ) else NULL) +
+  geom_point(
+    data = dt_all,
+    aes(x = PositionMb, y = HetMean),
+    size = 0.55, stroke = 0, color = "black", alpha = 0.85
+  ) +
+  geom_vline(
+    data = cen_df,
+    aes(xintercept = CenMb),
+    color = col_cen, linetype = "dashed", linewidth = 0.6, alpha = 0.9
+  ) +
+  facet_wrap(~ Chrom, scales = "free_x", ncol = 3) +
+  scale_fill_gradient(
+    name   = "Mean heterozygosity",
+    limits = c(0, 1),
+    low    = "white",
+    high   = "#d95f02",
+    na.value = "grey90"
+  ) +
+  guides(alpha = "none") +
+  labs(
+    title = paste0("Population ", POP, " mean heterozygosity signal (", RUNS_TAG, ")"),
+    x = "Position (Mb)",
+    y = "Mean heterozygosity"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    panel.grid = element_blank(),
+    strip.background = element_rect(fill = "grey90", colour = NA),
+    strip.text = element_text(face = "bold")
+  )
+
+out_path <- file.path(
+  OUT_DIR,
+  paste0("population_mean_heterozygosity_markerlevel_", RUNS_TAG, "_Pop", POP, ".", FILETYPE)
+)
+save_plot(p, out_path)
+message("[population het] wrote: ", out_path)
+
+```
+
+```{r}
+
+########################################################################
+## Recompute donor proportions in the same way as done during imputation
+########################################################################
+
+# Outputs:
+# - per_individual_chr_counts
+#   one row per WIL x chr with number of informative markers, used nonmissing markers, donor allele totals calculated including and excluding heterozygotes 
+# - per_individual_subgenome
+#   aggregates chromosome rows into per WIL x subgenome donor props, weighted by number of used markers
+# - population_subgenome_summary
+#   pop x subgenome mean and StdDev across WILs
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(stringr)
+})
+
+ROOT <- "/bulk/akf/Addy/Introgression_mapping/Genotype_matrices/Merged_byPopulation/filtered_parentHomPoly"
+POPS <- c(30,32,34,41,42,46,80)
+RUNS <- c("runs_pedOnly_l1_smoothed")
+
+OUTDIR <- file.path(ROOT, "AI2_donorprops_R_AWK_exact_l1_smoothed")
+dir.create(OUTDIR, showWarnings = FALSE, recursive = TRUE)
+
+# Parent map
+parent_map <- list(
+  "30_AB"=c(REC="RP2", DON="WE30"),
+  "30_D" =c(REC="RP2", DON="TA2"),
+  "32_AB"=c(REC="RP2", DON="WE32"),
+  "32_D" =c(REC="RP2", DON="TA2"),
+  "34_AB"=c(REC="RP2", DON="WE34"),
+  "34_D" =c(REC="RP2", DON="TA2"),
+  "41_AB"=c(REC="RP1", DON="WE41"),
+  "41_D" =c(REC="RP1", DON="TA2"),
+  "42_AB"=c(REC="RP1", DON="WE42"),
+  "42_D" =c(REC="RP1", DON="TA2"),
+  "46_AB"=c(REC="RP1", DON="WE46"),
+  "46_D" =c(REC="RP1", DON="TA2"),
+  "80_AB"=c(REC="RP1", DON="WE80"),
+  "80_D" =c(REC="RP1", DON="TA1")
+)
+
+infer_chr <- function(f) {
+  m <- str_match(f, "(chr[1-7][ABD])")[,2]
+  if (length(m) == 0) NA_character_ else m
+}
+infer_subkey <- function(chr) if (str_ends(chr, "D")) "D" else "AB"
+
+force_mat <- function(x, nrow = NULL) {
+  if (is.null(dim(x))) {
+    if (is.null(nrow)) nrow <- 1L
+    x <- matrix(x, nrow = nrow)
+  }
+  x
+}
+
+# Outputs data table with one row per WIL containing N_informative_markers, Used_inclHets, DonorAlleles_inclHets, Used_exclHets, DonorAlleles_exclHets
+compute_chr_counts <- function(Gwil, rec, don) {
+  Gwil <- force_mat(Gwil)
+  rec  <- as.integer(rec)
+  don  <- as.integer(don)
+
+  # informative markers
+  informative <- ((rec == 0L) | (rec == 2L)) &
+                 ((don == 0L) | (don == 2L)) &
+                 (rec != don)
+
+  if (!any(informative)) return(NULL)
+
+  # If donor is 2, donor allele count = g (0/1/2)
+  # If donor is 0, donor allele count = 2 - g
+  donor_is_2 <- (don[informative] == 2L)
+
+  Gsub <- Gwil[, informative, drop = FALSE]
+  Gsub <- force_mat(Gsub, nrow = nrow(Gwil))
+
+  called <- (!is.na(Gsub)) & ((Gsub == 0L) | (Gsub == 1L) | (Gsub == 2L))
+  called <- force_mat(called, nrow = nrow(Gsub))
+  used_incl <- rowSums(called)
+
+  # donor allele counts (hets included)
+  D <- Gsub
+  D <- force_mat(D, nrow = nrow(Gsub))
+
+  # flip columns where donor allele is 0 (so donor allele count = 2-g)
+  if (any(!donor_is_2)) {
+    idx_flip <- which(!donor_is_2)
+    D[, idx_flip] <- 2L - D[, idx_flip, drop = FALSE]
+  }
+
+  D[!called] <- 0L
+  donor_alleles_incl <- rowSums(D)
+
+  # donor allele counts (hets excluded): use only homozygotes (0/2)
+  hom <- (!is.na(Gsub)) & ((Gsub == 0L) | (Gsub == 2L))
+  hom <- force_mat(hom, nrow = nrow(Gsub))
+  used_excl <- rowSums(hom)
+
+  donor_hom <- matrix(FALSE, nrow = nrow(Gsub), ncol = ncol(Gsub))
+
+  if (any(donor_is_2)) {
+    idx2 <- which(donor_is_2)
+    donor_hom[, idx2] <- (Gsub[, idx2, drop = FALSE] == 2L)
+  }
+  if (any(!donor_is_2)) {
+    idx0 <- which(!donor_is_2)
+    donor_hom[, idx0] <- (Gsub[, idx0, drop = FALSE] == 0L)
+  }
+
+  donor_hom <- donor_hom & hom
+  donor_alleles_excl <- 2L * rowSums(donor_hom)
+
+  data.table(
+    N_informative_markers = as.integer(sum(informative)),
+    Used_inclHets = as.integer(used_incl),
+    DonorAlleles_inclHets = as.integer(donor_alleles_incl),
+    Used_exclHets = as.integer(used_excl),
+    DonorAlleles_exclHets = as.integer(donor_alleles_excl)
+  )
+}
+
+rows <- list()
+
+for (pop in POPS) {
+  for (run in RUNS) {
+
+    base <- file.path(ROOT, paste0("Pop", pop), "AI2", run)
+    if (!dir.exists(base)) next
+
+    files <- list.files(base, pattern = "\\.genotypes$", recursive = TRUE, full.names = TRUE)
+    if (!length(files)) next
+
+    message("Pop", pop, " / ", run, " : ", length(files), " files")
+
+    for (f in files) {
+      chr <- infer_chr(f)
+      if (is.na(chr)) next
+
+      subkey <- infer_subkey(chr)
+      pm <- parent_map[[paste0(pop, "_", subkey)]]
+      if (is.null(pm)) next
+
+      dt <- fread(f, header = FALSE, showProgress = FALSE)
+      ids <- dt[[1]]
+
+      rec_i <- which(ids == pm["REC"])
+      don_i <- which(ids == pm["DON"])
+      wil_i <- which(grepl(paste0("^WIL", pop, "\\."), ids))
+
+      if (!length(rec_i) || !length(don_i) || !length(wil_i)) next
+
+      G <- as.matrix(dt[, -1, with = FALSE])
+      storage.mode(G) <- "integer"
+      G[G == 9L] <- NA_integer_
+
+      rec <- G[rec_i, , drop = TRUE]
+      don <- G[don_i, , drop = TRUE]
+      Gwil <- G[wil_i, , drop = FALSE]
+
+      chr_dt <- compute_chr_counts(Gwil, rec, don)
+      if (is.null(chr_dt)) next
+
+      chr_dt[, `:=`(
+        ID = ids[wil_i],
+        Pop = paste0("Pop", pop),
+        Thinning = run,
+        Chr = chr,
+        Subgenome = substr(chr, nchar(chr), nchar(chr))
+      )]
+
+      rows[[length(rows) + 1L]] <- chr_dt
+    }
+  }
+}
+
+chr_dt <- rbindlist(rows, use.names = TRUE, fill = TRUE)
+
+# Write per-WIL x chromosome
+fwrite(chr_dt, file.path(OUTDIR, "per_individual_chr_counts.tsv"), sep = "\t")
+
+perIL_sub <- chr_dt[, .(
+  N_chr = .N,
+
+  N_used_total_incl = sum(Used_inclHets, na.rm = TRUE),
+  DonorProp_inclHets = {
+    denom <- sum(Used_inclHets, na.rm = TRUE)
+    if (denom > 0) sum(DonorAlleles_inclHets, na.rm = TRUE) / (2 * denom) else NA_real_
+  },
+
+  N_used_total_excl = sum(Used_exclHets, na.rm = TRUE),
+  DonorProp_exclHets = {
+    denom <- sum(Used_exclHets, na.rm = TRUE)
+    if (denom > 0) sum(DonorAlleles_exclHets, na.rm = TRUE) / (2 * denom) else NA_real_
+  }
+), by = .(ID, Pop, Thinning, Subgenome)][order(Pop, Thinning, Subgenome, ID)]
+
+fwrite(perIL_sub, file.path(OUTDIR, "per_individual_subgenome.tsv"), sep = "\t")
+
+# Population summary: mean & SD over individuals
+pop_sub <- perIL_sub[, .(
+  N_individuals = uniqueN(ID),
+
+  MeanDonorProp_inclHets = mean(DonorProp_inclHets, na.rm = TRUE),
+  SDDonorProp_inclHets   = sd(DonorProp_inclHets, na.rm = TRUE),
+
+  MeanDonorProp_exclHets = mean(DonorProp_exclHets, na.rm = TRUE),
+  SDDonorProp_exclHets   = sd(DonorProp_exclHets, na.rm = TRUE),
+
+  MeanUsed_incl = mean(N_used_total_incl, na.rm = TRUE),
+  MeanUsed_excl = mean(N_used_total_excl, na.rm = TRUE),
+  N_NA_incl = sum(is.na(DonorProp_inclHets)),
+  N_NA_excl = sum(is.na(DonorProp_exclHets))
+), by = .(Pop, Thinning, Subgenome)][order(Pop, Thinning, Subgenome)]
+
+fwrite(pop_sub, file.path(OUTDIR, "population_subgenome_summary.tsv"), sep = "\t")
+
+message("DONE. Wrote outputs to: ", OUTDIR)
+
+```
+
+```{r}
+
+############################################################
+### Proportion of WILs with introgressions by chromosome arm
+############################################################
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(stringr)
+})
+
+# =================== EDIT PATHS ===================
+ROOT_BYPOP <- "/bulk/akf/Addy/Introgression_mapping/Genotype_matrices/Merged_byPopulation/filtered_parentHomPoly"
+
+# File produced by donor prop script
+WIL_FP <- "/bulk/akf/Addy/Introgression_mapping/Genotype_matrices/Merged_byPopulation/filtered_parentHomPoly/AI2_donorprops_R_AWK_exact_l1_smoothed/per_individual_subgenome.tsv"
+# ==================================================
+
+# Output directory (must match segment aggregation script)
+OUTDIR <- file.path(ROOT_BYPOP, "AI2_aggregates_allparams")
+dir.create(OUTDIR, showWarnings = FALSE, recursive = TRUE)
+
+MASTER_FP <- file.path(OUTDIR, "segments_master.tsv")
+if (!file.exists(MASTER_FP)) {
+  stop("Missing segments_master.tsv at: ", MASTER_FP,
+       "\nRun your segment aggregation script first, or point MASTER_FP to the correct file.")
+}
+if (!file.exists(WIL_FP)) {
+  stop("Missing per_individual_subgenome.tsv at: ", WIL_FP,
+       "\nPoint WIL_FP to the correct file produced by your donor-prop script.")
+}
+
+# Centromere positions (Mb) used to split each chr into arms
+# arm assignment is whether a segment lies entirely before CenMB (S) or entirely after CenMb (L); if it spans CenMb, counts as both and contributes to both S and L
+CEN_MB <- c(
+  chr1A=211.5, chr1B=241.7, chr1D=169.7,
+  chr2A=340.9, chr2B=348.9, chr2D=266.5,
+  chr3A=318.8, chr3B=348.7, chr3D=240.5,
+  chr4A=266.1, chr4B=318.8, chr4D=185.2,
+  chr5A=253.0, chr5B=200.8, chr5D=187.6,
+  chr6A=287.1, chr6B=324.7, chr6D=215.4,
+  chr7A=361.9, chr7B=309.1, chr7D=338.2
+)
+
+# ---------- HELPERS ----------
+norm_chr <- function(x) {
+  x <- as.character(x)
+  x <- sub("^chr", "", x, ignore.case = TRUE)
+  x
+}
+
+# ---------- Load inputs ----------
+# wil: per WIL donor prop table only used to count total WILs per pop
+seg <- fread(MASTER_FP, sep = "\t", header = TRUE, data.table = TRUE)
+wil <- fread(WIL_FP, sep = "\t", header = TRUE, data.table = TRUE)
+
+# Ensure required columns exist
+need_seg <- c("Pop","Acc","Chr","Start","End","Method")
+miss_seg <- setdiff(need_seg, names(seg))
+if (length(miss_seg)) stop("segments_master.tsv missing columns: ", paste(miss_seg, collapse = ", "))
+
+need_wil <- c("ID","Pop")
+miss_wil <- setdiff(need_wil, names(wil))
+if (length(miss_wil)) stop("per_individual_subgenome.tsv missing columns: ", paste(miss_wil, collapse = ", "))
+
+seg[, Pop := as.integer(Pop)]
+
+wil[, Pop := as.integer(sub("^Pop", "", as.character(Pop)))]
+
+# Denominator per population
+denom <- wil[, .(n_total_lines = uniqueN(ID)), by = .(Pop)]
+
+seg[, Chr := norm_chr(Chr)]
+seg[, `:=`(
+  StartMb = as.numeric(Start) / 1e6,
+  EndMb   = as.numeric(End)   / 1e6
+)]
+
+cen_dt <- data.table(
+  Chr = norm_chr(names(CEN_MB)),
+  CenMb = as.numeric(CEN_MB)
+)
+
+seg <- merge(seg, cen_dt, by = "Chr", all.x = TRUE)
+if (any(is.na(seg$CenMb))) {
+  miss <- unique(seg[is.na(CenMb), Chr])
+  stop("Missing centromere midpoint for: ", paste(miss, collapse = ", "))
+}
+
+seg[, Arm := fifelse(
+  EndMb < CenMb, "S",
+  fifelse(StartMb > CenMb, "L", "Both")
+)]
+
+seg_arm <- rbindlist(list(
+  seg[Arm %in% c("S","L"), .(Pop, Method, Acc, Chr, Arm)],
+  seg[Arm == "Both", .(Pop, Method, Acc, Chr, Arm = "S")],
+  seg[Arm == "Both", .(Pop, Method, Acc, Chr, Arm = "L")]
+), use.names = TRUE)
+
+# Numerator: unique WILs with at least 1 segment on that arm
+num <- seg_arm[, .(n_lines_with_introgression = uniqueN(Acc)),
+               by = .(Pop, Method, Chr, Arm)]
+
+grid <- CJ(
+  Pop = sort(unique(denom$Pop)),
+  Method = sort(unique(seg$Method)),
+  Chr = sort(unique(seg$Chr)),
+  Arm = c("S","L"),
+  unique = TRUE
+)
+
+out <- merge(grid, num, by = c("Pop","Method","Chr","Arm"), all.x = TRUE)
+out[is.na(n_lines_with_introgression), n_lines_with_introgression := 0L]
+
+out <- merge(out, denom, by = "Pop", all.x = TRUE)
+# Proportion: numerator/denominator 
+out[, prop_lines_with_introgression := fifelse(
+  n_total_lines > 0, n_lines_with_introgression / n_total_lines, NA_real_
+)]
+
+setorder(out, Pop, Method, Chr, Arm)
+
+# Write final output table
+OUT_FP <- file.path(OUTDIR, "segments_prop_lines_with_introgression_by_arm_and_method.tsv")
+fwrite(out, OUT_FP, sep = "\t")
+
+cat("\n[OK] Wrote: ", OUT_FP, "\n", sep = "")
+
+```
+
+```{r}
+
+####################################################################
+## Plot segment lengths in Mb and as proportion of chromosome length
+####################################################################
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(ggplot2)
+  library(stringr)
+  library(readr)
+})
+
+# =================== EDIT PATHS ===================
+ROOT_BYPOP <- "/bulk/akf/Addy/Introgression_mapping/Genotype_matrices/Merged_byPopulation/filtered_parentHomPoly"
+# Directory created during segment aggregation
+AGG_DIR    <- file.path(ROOT_BYPOP, "AI2_aggregates_allparams")
+MASTER_FP  <- file.path(AGG_DIR, "segments_master.tsv")
+
+OUT_DIR <- file.path(AGG_DIR, "plots_segment_lengths_k10-5_k40-20_th10-0.9_th40-0.7")
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# What MA method to use for segment plotting
+METHOD_KEEP <- "k10-5_k40-20_th10-0.9_th40-0.7"
+# =================================================
+
+stopifnot(file.exists(MASTER_FP))
+seg <- fread(MASTER_FP)
+
+# Filter to one segment calling method
+df <- seg %>%
+  filter(Method == METHOD_KEEP)
+
+if (nrow(df) == 0) {
+  stop("No segments found for Method == ", METHOD_KEEP, " in: ", MASTER_FP)
+}
+
+# Chromosome lengths (Mb) used to convert segment lengths into proportions of chromosome length
+chr_lengths <- tibble::tibble(
+  Chr = c("1A","2A","3A","4A","5A","6A","7A",
+          "1B","2B","3B","4B","5B","6B","7B",
+          "1D","2D","3D","4D","5D","6D","7D"),
+  ChrLengthMb = c(
+    594.102, 780.799, 750.844, 744.588, 709.774, 618.079, 736.706,
+    689.852, 801.257, 830.830, 673.617, 713.150, 720.988, 750.620,
+    495.453, 651.853, 615.552, 509.857, 566.081, 473.593, 638.686
+  )
+)
+
+# Ensure expected columns exist
+need <- c("Pop","Acc","Chr","Start","End","LengthMb")
+miss <- setdiff(need, names(df))
+if (length(miss)) stop("segments_master.tsv missing required columns: ", paste(miss, collapse = ", "))
+
+df <- df %>%
+  mutate(
+    Chr = gsub("^chr", "", Chr, ignore.case = TRUE),
+    Pop = factor(Pop, levels = sort(unique(Pop))),
+    LengthMb = ifelse(is.na(LengthMb) & !is.na(Start) & !is.na(End),
+                      (as.numeric(End) - as.numeric(Start)) / 1e6, as.numeric(LengthMb))
+  ) %>%
+  left_join(chr_lengths, by = "Chr") %>%
+  mutate(PropChr = LengthMb / ChrLengthMb)
+
+if (any(is.na(df$ChrLengthMb))) {
+  bad <- unique(df$Chr[is.na(df$ChrLengthMb)])
+  stop("Missing chromosome lengths for: ", paste(bad, collapse = ", "))
+}
+
+# Summary HELPER
+# Returns number of segments, number of unique accessions contributing segments, mean/median length in Mb, mean/median length as proportion of chromosome
+summarize_lengths <- function(data) {
+  dplyr::summarise(
+    data,
+    n_segments      = dplyr::n(),
+    n_unique_Acc    = dplyr::n_distinct(Acc),
+    mean_lengthMb   = mean(LengthMb, na.rm = TRUE),
+    median_lengthMb = stats::median(LengthMb, na.rm = TRUE),
+    mean_propChr    = mean(PropChr, na.rm = TRUE),
+    median_propChr  = stats::median(PropChr, na.rm = TRUE),
+    .groups = "drop"
+  )
+}
+
+summary_overall <- summarize_lengths(df)
+
+summary_by_chrom <- df %>%
+  group_by(Chr) %>%
+  summarize_lengths() %>%
+  arrange(Chr)
+
+summary_by_pop <- df %>%
+  group_by(Pop) %>%
+  summarize_lengths() %>%
+  arrange(Pop)
+
+summary_by_pop_chrom <- df %>%
+  group_by(Pop, Chr) %>%
+  summarize_lengths() %>%
+  arrange(Pop, Chr)
+
+# Write CSVs
+readr::write_csv(summary_overall,      file.path(OUT_DIR, "segments_summary_overall.csv"))
+readr::write_csv(summary_by_chrom,     file.path(OUT_DIR, "segments_summary_by_chrom.csv"))
+readr::write_csv(summary_by_pop,       file.path(OUT_DIR, "segments_summary_by_pop.csv"))
+readr::write_csv(summary_by_pop_chrom, file.path(OUT_DIR, "segments_summary_by_pop_chrom.csv"))
+
+# Population color palette
+pop_cols <- c(
+  `30` = "#a6761d",
+  `32` = "#1b9e77",
+  `34` = "#d95f02",
+  `41` = "#7570b3",
+  `42` = "#e7298a",
+  `46` = "#66a61e",
+  `80` = "#e6ab02"
+)
+pop_cols <- pop_cols[names(pop_cols) %in% levels(df$Pop)]
+
+# Per-pop facets: Length (Mb)
+p_len_facets <- ggplot(df, aes(x = LengthMb, fill = Pop)) +
+  geom_histogram(binwidth = 10, color = "black", alpha = 0.85, show.legend = FALSE) +
+  facet_wrap(~ Pop, nrow = 2, ncol = 4) +
+  scale_fill_manual(values = pop_cols, drop = FALSE, guide = "none") +
+  theme_bw(base_size = 13) +
+  labs(
+    x = "Introgression length (Mb)",
+    y = "Segment count"
+  )
+
+# Per-pop facets: Proportion of chromosome
+p_prop_facets <- ggplot(df, aes(x = PropChr, fill = Pop)) +
+  geom_histogram(binwidth = 0.02, color = "black", alpha = 0.85, show.legend = FALSE) +
+  facet_wrap(~ Pop, nrow = 2, ncol = 4) +
+  scale_fill_manual(values = pop_cols, drop = FALSE, guide = "none") +
+  theme_bw(base_size = 13) +
+  labs(
+    x = "Introgression length (proportion of chromosome)",
+    y = "Segment count"
+  )
+
+# All populations combined
+p_len_all <- ggplot(df, aes(x = LengthMb)) +
+  geom_histogram(binwidth = 10, color = "black", fill = "grey70") +
+  theme_bw(base_size = 13) +
+  labs(
+    x = "Introgression length (Mb)",
+    y = "Segment count"
+  )
+
+p_prop_all <- ggplot(df, aes(x = PropChr)) +
+  geom_histogram(binwidth = 0.02, color = "black", fill = "grey70") +
+  theme_bw(base_size = 13) +
+  labs(
+    x = "Introgression length (proportion of chromosome)",
+    y = "Segment count"
+  )
+
+# Save
+ggsave(file.path(OUT_DIR, "perpop_lengths_mb.png"),   p_len_facets,  width = 12, height = 7, dpi = 300)
+ggsave(file.path(OUT_DIR, "perpop_lengths_prop.png"), p_prop_facets, width = 12, height = 7, dpi = 300)
+ggsave(file.path(OUT_DIR, "allpops_lengths_mb.png"),  p_len_all,     width = 7,  height = 5, dpi = 300)
+ggsave(file.path(OUT_DIR, "allpops_lengths_prop.png"),p_prop_all,    width = 7,  height = 5, dpi = 300)
+
+# Print file locations to logs
+cat("\n[OK] Wrote plots + summaries to:\n", OUT_DIR, "\n", sep = "")
+
+```
+
+```{r}
+
+########################################
+## Population-averaged donor proportions
+########################################
+
+# Visualize introgression signal by population along each chromosome 
+
+# ================= EDIT THESE =================
+ROOT_BYPOP <- "/bulk/akf/Addy/Introgression_mapping/Genotype_matrices/Merged_byPopulation/filtered_parentHomPoly"
+POP        <- 34
+METHOD_TAG <- "k10-5_k40-20_th10-0.9_th40-0.7"  # must match smoothing/segments tag
+
+OUT_DIR  <- file.path(ROOT_BYPOP, sprintf("Pop%d", POP), "AI2", "plots_population", METHOD_TAG)
+FILETYPE <- "png"
+WIDTH    <- 14
+HEIGHT   <- 8
+DPI      <- 300
+
+
+# Optional segment overlay
+ADD_SEGMENTS_OVERLAY <- TRUE
+
+# How to build a population consensus segment from per-WIL segments:
+CONSENSUS_BIN_MB     <- 1     # resolution to compute coverage along genome
+CONSENSUS_FRAC_IL    <- 0.03  # call as population segment if >= this fraction of WILs have a segment covering bin
+SEG_YMIN             <- 0.80  # vertical placement of overlay bars
+SEG_YMAX             <- 1.00
+
+# Optional domestication loci
+ADD_DOM_LOCI      <- TRUE
+SHOW_LOCI_LABELS  <- TRUE
+SHOW_LOCI_BANDS   <- FALSE
+SHOW_LOCI_TICKS   <- TRUE
+
+# Loci are defined per chr as Mb intervals
+DOM_LOCI <- data.frame(
+  Chrom   = c("chr5A","chr3A","chr3B","chr2D", "chr2A", "chr2B"),
+  StartMb = c(650,     65,      89,      21, 28, 38),
+  EndMb   = c(651,     66,      90,      22, 35, 50),
+  Name    = c("Q",     "BTR-A1","BTR-B1","Tg-D", "Tg-A", "Tg-B"),
+  stringsAsFactors = FALSE
+)
+LABEL_OFFSET_MB <- 0
+
+CHRS <- c("chr1A","chr1B","chr1D",
+          "chr2A","chr2B","chr2D",
+          "chr3A","chr3B","chr3D",
+          "chr4A","chr4B","chr4D",
+          "chr5A","chr5B","chr5D",
+          "chr6A","chr6B","chr6D",
+          "chr7A","chr7B","chr7D")
+
+# Centromere midpoints (Mb) to add vertical lines in plots
+CEN_MB <- c(
+  chr1A=211.5, chr1B=241.7, chr1D=169.7,
+  chr2A=340.9, chr2B=348.9, chr2D=266.5,
+  chr3A=318.8, chr3B=348.7, chr3D=240.5,
+  chr4A=266.1, chr4B=318.8, chr4D=185.2,
+  chr5A=253.0, chr5B=200.8, chr5D=187.6,
+  chr6A=287.1, chr6B=324.7, chr6D=215.4,
+  chr7A=361.9, chr7B=309.1, chr7D=338.2
+)
+
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(RColorBrewer)
+})
+
+POP_DIR  <- file.path(ROOT_BYPOP, sprintf("Pop%d", POP), "AI2")
+RUNS_DIR <- file.path(POP_DIR, "runs_pedOnly_l1_smoothed")
+
+if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+read_tsv <- function(f) read.table(f, header=TRUE, sep="\t", quote="",
+                                   comment.char="", stringsAsFactors=FALSE, check.names=FALSE)
+
+save_plot <- function(p, out_path) {
+  if (tolower(FILETYPE) == "png") {
+    ggsave(out_path, p, width = WIDTH, height = HEIGHT, dpi = DPI, device = "png", limitsize = FALSE)
+  } else {
+    ggsave(out_path, p, width = WIDTH, height = HEIGHT, device = "pdf", limitsize = FALSE)
+  }
+}
+
+# Collect bins_smooth
+bin_files <- list.files(
+  RUNS_DIR,
+  pattern = paste0("^Pop", POP, "_chr[1-7][ABD]_bins_smooth__", METHOD_TAG, "\\.tsv$"),
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+bin_files <- bin_files[grepl("/chr[1-7][ABD]/", bin_files)]
+if (!length(bin_files)) stop("No bins_smooth files found for Pop", POP, " tag=", METHOD_TAG)
+
+bins_list <- lapply(bin_files, function(f) {
+  df <- read_tsv(f)
+  need <- c("Acc","Chrom","Start","End","WE_prop","Sites")
+  miss <- setdiff(need, names(df))
+  if (length(miss)) stop("Missing columns in ", f, ": ", paste(miss, collapse=", "))
+  df
+})
+bins_all <- do.call(rbind, bins_list)
+
+chrom_to_chr <- function(x) {
+  x <- trimws(as.character(x))
+  x[x == ""] <- NA_character_
+  ifelse(grepl("^chr", x, ignore.case=TRUE), x, paste0("chr", x))
+}
+
+bins_all$Start   <- as.integer(bins_all$Start)
+bins_all$End     <- as.integer(bins_all$End)
+bins_all$Sites   <- as.integer(bins_all$Sites)
+bins_all$WE_prop <- pmin(1, pmax(0, as.numeric(bins_all$WE_prop)))
+bins_all$Chrom   <- factor(chrom_to_chr(bins_all$Chrom), levels = CHRS)
+
+# Compute population mean per bin
+agg <- aggregate(
+  WE_prop ~ Chrom + Start + End,
+  data = bins_all,
+  FUN = function(x) mean(x, na.rm = TRUE)
+)
+names(agg)[names(agg) == "WE_prop"] <- "WE_mean"
+
+contrib <- aggregate(
+  WE_prop ~ Chrom + Start + End,
+  data = bins_all,
+  FUN = function(x) sum(!is.na(x))
+)
+names(contrib)[names(contrib) == "WE_prop"] <- "N_contrib"
+
+agg_df <- merge(agg, contrib, by = c("Chrom","Start","End"), all.x = TRUE, sort = FALSE)
+agg_df$alpha    <- with(agg_df, ifelse(max(N_contrib, na.rm=TRUE) > 0,
+                                       0.3 + 0.7 * (N_contrib / max(N_contrib, na.rm=TRUE)), 1))
+agg_df$CenterMb <- ((agg_df$Start + agg_df$End) / 2) / 1e6
+
+# Build population consensus segments
+pop_segs_df <- NULL
+
+if (isTRUE(ADD_SEGMENTS_OVERLAY)) {
+
+  seg_files <- list.files(
+    RUNS_DIR,
+    pattern = paste0("^Pop", POP, "_chr[1-7][ABD]_segments__", METHOD_TAG, "\\.tsv$"),
+    recursive = TRUE,
+    full.names = TRUE
+  )
+  # find per chr segment tables
+  seg_files <- seg_files[grepl("/chr[1-7][ABD]/", seg_files)]
+
+  if (!length(seg_files)) {
+    message("[segments overlay] No segment files found for Pop", POP, " tag=", METHOD_TAG,
+            " -> overlay will be skipped.")
+  } else {
+
+    segs_list <- lapply(seg_files, function(f) {
+      df <- read_tsv(f)
+      # read segments, allowing empty files
+      if (!nrow(df)) return(df)
+      need <- c("Acc","Chrom","Start","End")
+      miss <- setdiff(need, names(df))
+      if (length(miss)) stop("Missing columns in segments file ", f, ": ", paste(miss, collapse=", "))
+      df
+    })
+    segs_all <- do.call(rbind, segs_list)
+
+    if (nrow(segs_all)) {
+      segs_all$Start <- as.integer(segs_all$Start)
+      segs_all$End   <- as.integer(segs_all$End)
+      segs_all$Chrom <- factor(chrom_to_chr(segs_all$Chrom), levels = CHRS)
+
+      ILs <- sort(unique(bins_all$Acc))
+      nIL <- length(ILs)
+
+      bin_bp <- as.integer(CONSENSUS_BIN_MB * 1e6)
+
+      # build consensus segments for a single chr
+      build_consensus_chr <- function(chr_df, chr_name) {
+        if (!nrow(chr_df)) return(NULL)
+
+        max_end <- max(chr_df$End, na.rm=TRUE)
+        starts  <- seq.int(0L, max_end, by = bin_bp)
+        ends    <- pmin(starts + bin_bp - 1L, max_end)
+        nb      <- length(starts)
+
+        cov <- integer(nb)
+
+        by_il <- split(chr_df, chr_df$Acc)
+        for (acc in names(by_il)) {
+          d <- by_il[[acc]]
+          hit <- logical(nb)
+          for (k in seq_len(nrow(d))) {
+            s <- d$Start[k]; e <- d$End[k]
+            i1 <- max(1L, floor(s / bin_bp) + 1L)
+            i2 <- min(nb, floor(e / bin_bp) + 1L)
+            if (i1 <= i2) hit[i1:i2] <- TRUE
+          }
+          cov[hit] <- cov[hit] + 1L
+        }
+
+        frac <- cov / nIL
+        call <- frac >= CONSENSUS_FRAC_IL
+        if (!any(call)) return(NULL)
+
+        r <- rle(call)
+        ends_r   <- cumsum(r$lengths)
+        starts_r <- c(1, head(ends_r, -1) + 1)
+
+        out <- list()
+        for (j in seq_along(r$values)) {
+          if (!r$values[j]) next
+          i1 <- starts_r[j]; i2 <- ends_r[j]
+          out[[length(out)+1L]] <- data.frame(
+            Chrom = chr_name,
+            Start = starts[i1],
+            End   = ends[i2],
+            FracIL = mean(frac[i1:i2], na.rm=TRUE),
+            stringsAsFactors = FALSE
+          )
+        }
+        do.call(rbind, out)
+      }
+
+      pop_segs_list <- lapply(levels(segs_all$Chrom), function(ch) {
+        dfc <- segs_all[segs_all$Chrom == ch & !is.na(segs_all$Chrom), , drop=FALSE]
+        build_consensus_chr(dfc, ch)
+      })
+      pop_segs_df <- do.call(rbind, pop_segs_list)
+
+      if (!is.null(pop_segs_df) && nrow(pop_segs_df)) {
+        pop_segs_df$Chrom <- factor(pop_segs_df$Chrom, levels = CHRS)
+        pop_segs_df$ymin  <- SEG_YMIN
+        pop_segs_df$ymax  <- SEG_YMAX
+      } else {
+        pop_segs_df <- NULL
+        message("[segments overlay] No consensus segments passed CONSENSUS_FRAC_IL = ", CONSENSUS_FRAC_IL)
+      }
+    } else {
+      message("[segments overlay] Segment files exist but contain zero rows.")
+    }
+  }
+}
+
+# Domestication loci prep
+dom_df <- NULL
+labs_df <- NULL
+if (isTRUE(ADD_DOM_LOCI)) {
+  dom_df <- DOM_LOCI
+  dom_df$Chrom <- factor(dom_df$Chrom, levels = CHRS)
+  dom_df$MidMb <- (dom_df$StartMb + dom_df$EndMb) / 2
+
+  chr_maxMb <- aggregate(End ~ Chrom, data = agg_df, FUN = function(x) max(x, na.rm=TRUE) / 1e6)
+  names(chr_maxMb)[2] <- "maxMb"
+
+  labs_df <- merge(dom_df, chr_maxMb, by="Chrom", all.x=TRUE, sort=FALSE)
+  labs_df$Xlab <- pmin(labs_df$EndMb + LABEL_OFFSET_MB, labs_df$maxMb - 1)
+  labs_df$Ylab <- 0.7
+}
+
+# Centromeres
+cen_df <- data.frame(
+  Chrom = factor(names(CEN_MB), levels = CHRS),
+  CenMb = as.numeric(CEN_MB),
+  stringsAsFactors = FALSE
+)
+
+# Palette to define centromere, segment, and domestication loci coloring
+pal <- brewer.pal(8, "Dark2")
+col_cen  <- pal[4]
+col_seg  <- pal[1]
+col_loci <- pal[4]
+
+# -------------------- Plot --------------------
+p <- ggplot() +
+  # Domestication loci
+  { if (!is.null(dom_df) && nrow(dom_df) && isTRUE(SHOW_LOCI_BANDS))
+      geom_rect(
+        data = dom_df,
+        aes(xmin = StartMb, xmax = EndMb, ymin = 0, ymax = 1),
+        inherit.aes = FALSE,
+        fill = col_loci, alpha = 0.12,
+        color = col_loci, linewidth = 0.25
+      ) else NULL } +
+  geom_rect(
+    data = agg_df,
+    aes(xmin = Start/1e6, xmax = End/1e6, ymin = 0, ymax = 1,
+        fill = WE_mean, alpha = alpha),
+    color = NA
+  ) +
+  geom_point(
+    data = agg_df[order(agg_df$Chrom, agg_df$CenterMb), ],
+    aes(x = CenterMb, y = WE_mean),
+    size = 1.4, stroke = 0, color = "black", alpha = 0.95
+  ) +
+  # OPTIONAL: population-consensus segments as top bars
+  (if (!is.null(pop_segs_df) && nrow(pop_segs_df))
+     geom_rect(
+       data = pop_segs_df,
+       aes(xmin = Start/1e6, xmax = End/1e6, ymin = ymin, ymax = ymax),
+       inherit.aes = FALSE,
+       fill = NA, color = col_seg, linewidth = 0.7
+     ) else NULL) +
+  # OPTIONAL: locus midpoint ticks
+  { if (!is.null(dom_df) && isTRUE(SHOW_LOCI_TICKS))
+      geom_vline(
+        data = dom_df,
+        aes(xintercept = MidMb),
+        color = col_loci, linewidth = 0.6, alpha = 0.9
+      ) else NULL } +
+  # Centromeres
+  geom_vline(
+    data = cen_df,
+    aes(xintercept = CenMb),
+    color = col_cen, linetype = "dashed", linewidth = 0.6, alpha = 0.9
+  ) +
+  # OPTIONAL: loci labels
+  { if (!is.null(labs_df) && isTRUE(SHOW_LOCI_LABELS))
+      geom_label(
+        data = labs_df,
+        aes(x = Xlab, y = Ylab, label = Name),
+        inherit.aes = FALSE,
+        size = 3,
+        label.size = 0,
+        fill = "white", alpha = 0.6,
+        hjust = 0, vjust = 0.5
+      ) else NULL } +
+  facet_wrap(~ Chrom, scales = "free_x", ncol = 3) +
+  scale_fill_gradient(
+    name   = "Mean donor proportion",
+    limits = c(0, 1),
+    low    = "white",
+    high   = "#7570b3",
+    na.value = "grey90"
+  ) +
+  guides(alpha = "none") +
+  labs(
+    title = paste0("Population ", POP, " mean introgression signal"),
+    x = "Position (Mb)",
+    y = "Mean donor proportion"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    panel.grid = element_blank(),
+    strip.background = element_rect(fill = "grey90", colour = NA),
+    strip.text = element_text(face = "bold"),
+    plot.margin = margin(5.5, 5.5, 5.5, 5.5)  # leave room for labels above
+  ) +
+  coord_cartesian(ylim = c(0, 1.08), clip = "off")  # allow labels above panel
+
+out_path <- file.path(
+  OUT_DIR,
+  paste0("population_mean_introgressions_Pop", POP, "_", METHOD_TAG,
+         if (isTRUE(ADD_SEGMENTS_OVERLAY)) "_withConsensusSegments" else "",
+         if (isTRUE(ADD_DOM_LOCI)) "_withDomLoci" else "",
+         ".", ifelse(tolower(FILETYPE)=="png","png","pdf"))
+)
+save_plot(p, out_path)
+message("[population] wrote: ", out_path)
+
+
+```
+
+```{r}
+
+#####################################################
+## Compare population consensus segments by MA method
+#####################################################
+
+# ================= EDIT THESE =================
+ROOT_BYPOP <- "/bulk/akf/Addy/Introgression_mapping/Genotype_matrices/Merged_byPopulation/filtered_parentHomPoly"
+POP        <- 80 # population to visualize
+
+# MA method tags to compage (must match suffix used in segment filename)
+METHOD_TAGS <- c(
+  "k10-1_k40-5_th10-0.9_th40-0.7",
+  "k10-3_k40-10_th10-0.9_th40-0.7",
+  "k10-5_k40-20_th10-0.9_th40-0.7",
+  "k10-10_k40-30_th10-0.9_th40-0.7",
+  "k10-25_k40-50_th10-0.9_th40-0.7"
+)
+
+# Labels for each method tag
+METHOD_LABELS <- c(
+  "MA2/MA10",
+  "MA6/MA20",
+  "MA10/MA40",
+  "MA20/MA60",
+  "MA50/MA100"
+)
+
+# Method colors (must match METHOD_LABELS exactly)
+METHOD_COLORS <- c(
+  "MA2/MA10"    = "#d95f02",
+  "MA6/MA20"   = "#7570b3",
+  "MA10/MA40"  = "#1b9e77",
+  "MA20/MA60"  = "#e7298a",
+  "MA50/MA100" = "#66a61e"
+)
+
+OUT_DIR  <- file.path(ROOT_BYPOP, sprintf("Pop%d", POP), "AI2", "plots_population", "COMPARE_METHODS")
+FILETYPE <- "png"
+WIDTH    <- 14
+HEIGHT   <- 9
+DPI      <- 300
+
+# Consensus segment calling
+CONSENSUS_BIN_MB  <- 1
+CONSENSUS_FRAC_IL <- 0.03
+
+LANE_HEIGHT <- 0.50
+LANE_GAP    <- 0.15
+
+# Optional domestication loci
+ADD_DOM_LOCI      <- TRUE
+SHOW_LOCI_LABELS  <- TRUE
+SHOW_LOCI_BANDS   <- FALSE
+SHOW_LOCI_TICKS   <- TRUE
+
+DOM_LOCI <- data.frame(
+  Chrom   = c("chr5A","chr3A","chr3B","chr2D", "chr2A", "chr2B"),
+  StartMb = c(650,     65,      89,      21, 28, 38),
+  EndMb   = c(651,     66,      90,      22, 35, 50),
+  Name    = c("Q",     "BTR-A1","BTR-B1","Tg-D", "Tg-A", "Tg-B"),
+  stringsAsFactors = FALSE
+)
+LABEL_OFFSET_MB <- 0
+
+X_TICK_MB <- 200 # tick spacing per facet in Mb
+
+CHRS <- c("chr1A","chr1B","chr1D",
+          "chr2A","chr2B","chr2D",
+          "chr3A","chr3B","chr3D",
+          "chr4A","chr4B","chr4D",
+          "chr5A","chr5B","chr5D",
+          "chr6A","chr6B","chr6D",
+          "chr7A","chr7B","chr7D")
+
+CEN_MB <- c(
+  chr1A=211.5, chr1B=241.7, chr1D=169.7,
+  chr2A=340.9, chr2B=348.9, chr2D=266.5,
+  chr3A=318.8, chr3B=348.7, chr3D=240.5,
+  chr4A=266.1, chr4B=318.8, chr4D=185.2,
+  chr5A=253.0, chr5B=200.8, chr5D=187.6,
+  chr6A=287.1, chr6B=324.7, chr6D=215.4,
+  chr7A=361.9, chr7B=309.1, chr7D=338.2
+)
+
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(RColorBrewer)
+})
+
+if (length(METHOD_TAGS) != length(METHOD_LABELS)) stop("METHOD_TAGS and METHOD_LABELS must have the same length.")
+if (!all(METHOD_LABELS %in% names(METHOD_COLORS))) {
+  miss <- setdiff(METHOD_LABELS, names(METHOD_COLORS))
+  stop("METHOD_COLORS is missing names for: ", paste(miss, collapse=", "))
+}
+
+POP_DIR  <- file.path(ROOT_BYPOP, sprintf("Pop%d", POP), "AI2")
+RUNS_DIR <- file.path(POP_DIR, "runs_pedOnly_l1_smoothed")
+
+if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+read_tsv <- function(f) read.table(f, header=TRUE, sep="\t", quote="",
+                                   comment.char="", stringsAsFactors=FALSE, check.names=FALSE)
+
+save_plot <- function(p, out_path) {
+  if (tolower(FILETYPE) == "png") {
+    ggsave(out_path, p, width = WIDTH, height = HEIGHT, dpi = DPI, device = "png", limitsize = FALSE)
+  } else {
+    ggsave(out_path, p, width = WIDTH, height = HEIGHT, device = "pdf", limitsize = FALSE)
+  }
+}
+
+chrom_to_chr <- function(x) {
+  x <- trimws(as.character(x))
+  x[x == ""] <- NA_character_
+  ifelse(grepl("^chr", x, ignore.case=TRUE), x, paste0("chr", x))
+}
+
+# HELPER
+get_il_universe <- function(method_tag) {
+  bin_files <- list.files(
+    RUNS_DIR,
+    pattern = paste0("^Pop", POP, "_chr[1-7][ABD]_bins_smooth__", method_tag, "\\.tsv$"),
+    recursive = TRUE,
+    full.names = TRUE
+  )
+  bin_files <- bin_files[grepl("/chr[1-7][ABD]/", bin_files)]
+  if (!length(bin_files)) stop("No bins_smooth files found for Pop", POP, " method_tag=", method_tag)
+
+  accs <- character()
+  for (f in bin_files) {
+    df <- read_tsv(f)
+    if (!"Acc" %in% names(df)) stop("Missing Acc in ", f)
+    accs <- c(accs, as.character(df$Acc))
+  }
+  sort(unique(accs))
+}
+
+# HELPER: build population consensus segments
+build_consensus_segments <- function(segs_all, ILs, bin_mb = 1, frac_il = 0.05) {
+  if (!nrow(segs_all)) return(NULL)
+
+  segs_all$Start <- as.integer(segs_all$Start)
+  segs_all$End   <- as.integer(segs_all$End)
+  segs_all$Chrom <- factor(chrom_to_chr(segs_all$Chrom), levels = CHRS)
+
+  nIL <- length(ILs)
+  if (nIL == 0) stop("IL universe is empty; cannot compute consensus.")
+  bin_bp <- as.integer(bin_mb * 1e6)
+
+  build_consensus_chr <- function(chr_df, chr_name) {
+    if (!nrow(chr_df)) return(NULL)
+
+    max_end <- max(chr_df$End, na.rm=TRUE)
+    starts  <- seq.int(0L, max_end, by = bin_bp)
+    ends    <- pmin(starts + bin_bp - 1L, max_end)
+    nb      <- length(starts)
+    cov     <- integer(nb)
+
+    by_il <- split(chr_df, chr_df$Acc)
+
+    for (acc in intersect(names(by_il), ILs)) {
+      d <- by_il[[acc]]
+      hit <- logical(nb)
+      for (k in seq_len(nrow(d))) {
+        s <- d$Start[k]; e <- d$End[k]
+        i1 <- max(1L, floor(s / bin_bp) + 1L)
+        i2 <- min(nb, floor(e / bin_bp) + 1L)
+        if (i1 <= i2) hit[i1:i2] <- TRUE
+      }
+      cov[hit] <- cov[hit] + 1L
+    }
+
+    frac <- cov / nIL
+    call <- frac >= frac_il
+    if (!any(call)) return(NULL)
+
+    # Compress contiguous called bins into consensus segments
+    r <- rle(call)
+    ends_r   <- cumsum(r$lengths)
+    starts_r <- c(1, head(ends_r, -1) + 1)
+
+    out <- list()
+    for (j in seq_along(r$values)) {
+      if (!r$values[j]) next
+      i1 <- starts_r[j]; i2 <- ends_r[j]
+      out[[length(out)+1L]] <- data.frame(
+        Chrom  = chr_name,
+        Start  = starts[i1],
+        End    = ends[i2],
+        FracIL = mean(frac[i1:i2], na.rm=TRUE),
+        stringsAsFactors = FALSE
+      )
+    }
+    do.call(rbind, out)
+  }
+
+  pop_segs_list <- lapply(levels(segs_all$Chrom), function(ch) {
+    dfc <- segs_all[segs_all$Chrom == ch & !is.na(segs_all$Chrom), , drop=FALSE]
+    build_consensus_chr(dfc, ch)
+  })
+  out <- do.call(rbind, pop_segs_list)
+
+  if (is.null(out) || !nrow(out)) return(NULL)
+  out$Chrom <- factor(out$Chrom, levels = CHRS)
+  out
+}
+
+# Backbone bins to force full chromosome x-span
+BACKBONE_TAG <- METHOD_TAGS[1]
+
+backbone_files <- list.files(
+  RUNS_DIR,
+  pattern = paste0("^Pop", POP, "_chr[1-7][ABD]_bins_smooth__", BACKBONE_TAG, "\\.tsv$"),
+  recursive = TRUE,
+  full.names = TRUE
+)
+backbone_files <- backbone_files[grepl("/chr[1-7][ABD]/", backbone_files)]
+if (!length(backbone_files)) stop("No backbone bins_smooth files found for Pop", POP, " tag=", BACKBONE_TAG)
+
+backbone <- do.call(rbind, lapply(backbone_files, function(f) {
+  df <- read_tsv(f)
+  need <- c("Chrom","Start","End")
+  miss <- setdiff(need, names(df))
+  if (length(miss)) stop("Backbone bins missing columns in ", f, ": ", paste(miss, collapse=", "))
+  df[, need]
+}))
+
+backbone$Chrom <- factor(chrom_to_chr(backbone$Chrom), levels = CHRS)
+backbone$Start <- as.integer(backbone$Start)
+backbone$End   <- as.integer(backbone$End)
+backbone$xminMb <- backbone$Start / 1e6
+backbone$xmaxMb <- backbone$End   / 1e6
+
+# Load and compute consensus segments for each method
+all_methods_segs <- list()
+
+USE_METHOD_SPECIFIC_ILS <- FALSE
+ILs_base <- get_il_universe(METHOD_TAGS[1])
+
+for (i in seq_along(METHOD_TAGS)) {
+  tag <- METHOD_TAGS[i]
+
+  seg_files <- list.files(
+    RUNS_DIR,
+    pattern = paste0("^Pop", POP, "_chr[1-7][ABD]_segments__", tag, "\\.tsv$"),
+    recursive = TRUE,
+    full.names = TRUE
+  )
+  seg_files <- seg_files[grepl("/chr[1-7][ABD]/", seg_files)]
+
+  if (!length(seg_files)) {
+    message("[compare] No segment files found for method tag: ", tag, " -> skipping")
+    next
+  }
+
+  segs_list <- lapply(seg_files, function(f) {
+    df <- read_tsv(f)
+    if (!nrow(df)) return(df)
+    need <- c("Acc","Chrom","Start","End")
+    miss <- setdiff(need, names(df))
+    if (length(miss)) stop("Missing columns in segments file ", f, ": ", paste(miss, collapse=", "))
+    df
+  })
+  segs_all <- do.call(rbind, segs_list)
+
+  # Determine WIL denominator
+  ILs_use <- if (USE_METHOD_SPECIFIC_ILS) get_il_universe(tag) else ILs_base
+
+  if (!nrow(segs_all)) {
+    message("[compare] Method tag has segment files but zero rows: ", tag)
+    next
+  }
+
+  cons <- build_consensus_segments(
+    segs_all = segs_all,
+    ILs      = ILs_use,
+    bin_mb   = CONSENSUS_BIN_MB,
+    frac_il  = CONSENSUS_FRAC_IL
+  )
+
+  if (is.null(cons) || !nrow(cons)) {
+    message("[compare] No consensus segments passed threshold for method tag: ", tag)
+    next
+  }
+
+  cons$MethodTag <- tag
+  cons$MethodLbl <- METHOD_LABELS[i]
+  all_methods_segs[[length(all_methods_segs)+1L]] <- cons
+}
+
+seg_df <- do.call(rbind, all_methods_segs)
+if (is.null(seg_df) || !nrow(seg_df)) stop("No consensus segments to plot across methods.")
+
+# Assign method lanes
+method_levels <- METHOD_LABELS
+seg_df$MethodLbl <- factor(seg_df$MethodLbl, levels = method_levels)
+seg_df$lane <- as.numeric(seg_df$MethodLbl)
+seg_df$ymin <- seg_df$lane - (LANE_HEIGHT / 2)
+seg_df$ymax <- seg_df$lane + (LANE_HEIGHT / 2)
+
+# Centromeres
+cen_df <- data.frame(
+  Chrom = factor(names(CEN_MB), levels = CHRS),
+  CenMb = as.numeric(CEN_MB),
+  stringsAsFactors = FALSE
+)
+
+# Domestication loci
+dom_df <- NULL
+labs_df <- NULL
+if (isTRUE(ADD_DOM_LOCI)) {
+  dom_df <- DOM_LOCI
+  dom_df$Chrom <- factor(dom_df$Chrom, levels = CHRS)
+  dom_df$MidMb <- (dom_df$StartMb + dom_df$EndMb) / 2
+
+  # cap labels to full chromosome range using backbone, not segment range
+  chr_maxMb <- aggregate(xmaxMb ~ Chrom, data = backbone, FUN = max)
+  names(chr_maxMb)[2] <- "maxMb"
+
+  labs_df <- merge(dom_df, chr_maxMb, by="Chrom", all.x=TRUE, sort=FALSE)
+  labs_df$Xlab <- pmin(labs_df$EndMb + LABEL_OFFSET_MB, labs_df$maxMb - 1)
+  labs_df$Ylab <- max(seg_df$lane) + 0.35
+}
+
+# -------------------- Plot --------------------
+pal <- RColorBrewer::brewer.pal(8, "Dark2")
+col_cen  <- pal[7]
+col_loci <- pal[7]
+
+p <- ggplot() +
+  # Invisible backbone rectangles: forces each facet to span full chromosome
+  geom_rect(
+    data = backbone,
+    aes(xmin = xminMb, xmax = xmaxMb, ymin = 0, ymax = 1),
+    inherit.aes = FALSE,
+    alpha = 0, color = NA
+  ) +
+  # Domestication locus bands spanning all method lanes
+  { if (!is.null(dom_df) && nrow(dom_df) && isTRUE(SHOW_LOCI_BANDS))
+      geom_rect(
+        data = dom_df,
+        aes(xmin = StartMb, xmax = EndMb,
+            ymin = 0.5, ymax = max(seg_df$lane) + 0.5),
+        inherit.aes = FALSE,
+        fill = col_loci, alpha = 0.12,
+        color = col_loci, linewidth = 0.25
+      ) else NULL } +
+  # Consensus segment boxes in method lanes (colored by method)
+  geom_rect(
+    data = seg_df,
+    aes(xmin = Start/1e6, xmax = End/1e6, ymin = ymin, ymax = ymax, color = MethodLbl),
+    fill = NA, linewidth = 0.85
+  ) +
+  # Optional locus midpoint ticks
+  { if (!is.null(dom_df) && isTRUE(SHOW_LOCI_TICKS))
+      geom_vline(
+        data = dom_df,
+        aes(xintercept = MidMb),
+        color = col_loci, linewidth = 0.6, alpha = 0.9
+      ) else NULL } +
+  # Centromeres
+  geom_vline(
+    data = cen_df,
+    aes(xintercept = CenMb),
+    color = col_cen, linetype = "dashed", linewidth = 0.6, alpha = 0.9
+  ) +
+  # Optional domestication locus labels
+  { if (!is.null(labs_df) && isTRUE(SHOW_LOCI_LABELS))
+      geom_label(
+        data = labs_df,
+        aes(x = Xlab, y = Ylab, label = Name),
+        inherit.aes = FALSE,
+        size = 3,
+        label.size = 0,
+        fill = "white", alpha = 0.4,
+        hjust = 0, vjust = 0.5
+      ) else NULL } +
+  facet_wrap(~ Chrom, scales = "free_x", ncol = 3) +
+  scale_x_continuous(
+    breaks = function(lim) {
+      seq(0, ceiling(lim[2] / X_TICK_MB) * X_TICK_MB, by = X_TICK_MB)
+    }
+  ) +
+  scale_y_continuous(
+    breaks = seq_along(method_levels),
+    labels = method_levels,
+    expand = expansion(mult = c(0.02, 0.10))
+  ) +
+  scale_color_manual(values = METHOD_COLORS, drop = FALSE) +
+  labs(
+    title = paste0("Pop", POP, ": introgression segments across methods"),
+    x = "Position (Mb)",
+    y = NULL
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    panel.grid = element_blank(),
+    strip.background = element_rect(fill = "grey90", colour = NA),
+    strip.text = element_text(face = "bold"),
+    legend.position = "none"
+  )
+
+out_path <- file.path(
+  OUT_DIR,
+  paste0("Pop", POP, "_compareMethods_consensusSegments__",
+         "bin", CONSENSUS_BIN_MB, "Mb_frac", CONSENSUS_FRAC_IL,
+         "_backbone__", BACKBONE_TAG,
+         if (isTRUE(ADD_DOM_LOCI)) "_withDomLoci" else "",
+         ".", ifelse(tolower(FILETYPE)=="png","png","pdf"))
+)
+save_plot(p, out_path)
+message("[compare] wrote: ", out_path)
+
+```
+
+```{r}
+
+################################################################
+## Per-WIL plots - introgression segments and domestication loci
+################################################################
+
+# ================= EDIT THESE =================
+ROOT_BYPOP <- "/bulk/akf/Addy/Introgression_mapping/Genotype_matrices/Merged_byPopulation/filtered_parentHomPoly"
+POP        <- 46 # population to plot
+RUN_TAG    <- "runs_pedOnly_l1_smoothed"
+METHOD_TAG <- "k10-5_k40-20_th10-0.9_th40-0.7"
+
+OUT_DIR  <- file.path(ROOT_BYPOP, sprintf("Pop%d", POP), "AI2", "plots_perIL", METHOD_TAG)
+FILETYPE <- "png"
+WIDTH    <- 14
+HEIGHT   <- 8
+DPI      <- 300
+
+# Optional per-WIL segment overlay
+ADD_SEGMENTS_OVERLAY <- TRUE
+SEG_YMIN             <- 0.00
+SEG_YMAX             <- 1.00
+
+# Optional domestication loci
+ADD_DOM_LOCI      <- TRUE
+SHOW_LOCI_LABELS  <- TRUE
+SHOW_LOCI_BANDS   <- FALSE
+SHOW_LOCI_TICKS   <- TRUE
+
+DOM_LOCI <- data.frame(
+  Chrom   = c("chr5A","chr3A","chr3B","chr2D", "chr2A", "chr2B"),
+  StartMb = c(650,     65,      89,      21,     28,     38),
+  EndMb   = c(651,     66,      90,      22,     35,     50),
+  Name    = c("Q",     "BTR-A1","BTR-B1","Tg-D", "Tg-A", "Tg-B"),
+  stringsAsFactors = FALSE
+)
+LABEL_OFFSET_MB <- 0
+
+CHRS <- c("chr1A","chr1B","chr1D",
+          "chr2A","chr2B","chr2D",
+          "chr3A","chr3B","chr3D",
+          "chr4A","chr4B","chr4D",
+          "chr5A","chr5B","chr5D",
+          "chr6A","chr6B","chr6D",
+          "chr7A","chr7B","chr7D")
+
+CEN_MB <- c(
+  chr1A=211.5, chr1B=241.7, chr1D=169.7,
+  chr2A=340.9, chr2B=348.9, chr2D=266.5,
+  chr3A=318.8, chr3B=348.7, chr3D=240.5,
+  chr4A=266.1, chr4B=318.8, chr4D=185.2,
+  chr5A=253.0, chr5B=200.8, chr5D=187.6,
+  chr6A=287.1, chr6B=324.7, chr6D=215.4,
+  chr7A=361.9, chr7B=309.1, chr7D=338.2
+)
+
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(RColorBrewer)
+})
+
+POP_DIR  <- file.path(ROOT_BYPOP, sprintf("Pop%d", POP), "AI2")
+RUNS_DIR <- file.path(POP_DIR, RUN_TAG)
+
+if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+read_tsv <- function(f) read.table(f, header=TRUE, sep="\t", quote="",
+                                   comment.char="", stringsAsFactors=FALSE, check.names=FALSE)
+
+save_plot <- function(p, out_path) {
+  if (tolower(FILETYPE) == "png") {
+    ggsave(out_path, p, width = WIDTH, height = HEIGHT, dpi = DPI, device = "png", limitsize = FALSE)
+  } else {
+    ggsave(out_path, p, width = WIDTH, height = HEIGHT, device = "pdf", limitsize = FALSE)
+  }
+}
+
+chrom_to_chr <- function(x) {
+  x <- trimws(as.character(x))
+  x[x == ""] <- NA_character_
+  ifelse(grepl("^chr", x, ignore.case=TRUE), x, paste0("chr", x))
+}
+
+safe_filename <- function(x) {
+  x <- as.character(x)
+  x <- gsub("[[:space:]]+", "_", x)
+  gsub("[^A-Za-z0-9_\\-\\.]+", "_", x)
+}
+
+# Collect bins_smooth
+bin_files <- list.files(
+  RUNS_DIR,
+  pattern = paste0("^Pop", POP, "_chr[1-7][ABD]_bins_smooth__", METHOD_TAG, "\\.tsv$"),
+  recursive = TRUE,
+  full.names = TRUE
+)
+bin_files <- bin_files[grepl("/chr[1-7][ABD]/", bin_files)]
+if (!length(bin_files)) stop("No bins_smooth files found for Pop", POP, " tag=", METHOD_TAG)
+
+bins_list <- lapply(bin_files, function(f) {
+  df <- read_tsv(f)
+  need <- c("Acc","Chrom","Start","End","WE_prop","Sites")
+  miss <- setdiff(need, names(df))
+  if (length(miss)) stop("Missing columns in ", f, ": ", paste(miss, collapse=", "))
+  df
+})
+bins_all <- do.call(rbind, bins_list)
+
+bins_all$Start    <- as.integer(bins_all$Start)
+bins_all$End      <- as.integer(bins_all$End)
+bins_all$Sites    <- as.integer(bins_all$Sites)
+bins_all$WE_prop  <- pmin(1, pmax(0, as.numeric(bins_all$WE_prop)))
+bins_all$Chrom    <- factor(chrom_to_chr(bins_all$Chrom), levels = CHRS)
+bins_all$CenterMb <- ((bins_all$Start + bins_all$End) / 2) / 1e6
+
+max_sites <- suppressWarnings(max(bins_all$Sites, na.rm = TRUE))
+if (!is.finite(max_sites) || max_sites <= 0) max_sites <- 1
+bins_all$alpha_sites <- 0.25 + 0.75 * (pmin(bins_all$Sites, max_sites) / max_sites)
+
+ILs <- sort(unique(bins_all$Acc))
+if (!length(ILs)) stop("No ILs (Acc) found in bins_smooth files for Pop", POP)
+
+# Optional: overlay per-WIL called introgression segments
+segs_all <- NULL
+if (isTRUE(ADD_SEGMENTS_OVERLAY)) {
+  seg_files <- list.files(
+    RUNS_DIR,
+    pattern = paste0("^Pop", POP, "_chr[1-7][ABD]_segments__", METHOD_TAG, "\\.tsv$"),
+    recursive = TRUE,
+    full.names = TRUE
+  )
+  seg_files <- seg_files[grepl("/chr[1-7][ABD]/", seg_files)]
+
+  if (!length(seg_files)) {
+    message("[segments overlay] No segment files found -> overlay skipped.")
+  } else {
+    segs_list <- lapply(seg_files, function(f) {
+      df <- read_tsv(f)
+      if (!nrow(df)) return(df)
+      need <- c("Acc","Chrom","Start","End")
+      miss <- setdiff(need, names(df))
+      if (length(miss)) stop("Missing columns in segments file ", f, ": ", paste(miss, collapse=", "))
+      df
+    })
+    segs_all <- do.call(rbind, segs_list)
+    if (nrow(segs_all)) {
+      segs_all$Start <- as.integer(segs_all$Start)
+      segs_all$End   <- as.integer(segs_all$End)
+      segs_all$Chrom <- factor(chrom_to_chr(segs_all$Chrom), levels = CHRS)
+    } else {
+      segs_all <- NULL
+      message("[segments overlay] Segment files exist but contain zero rows.")
+    }
+  }
+}
+
+# Centromeres
+cen_df <- data.frame(
+  Chrom = factor(names(CEN_MB), levels = CHRS),
+  CenMb = as.numeric(CEN_MB),
+  stringsAsFactors = FALSE
+)
+
+# Domestication loci
+dom_df <- NULL
+labs_df <- NULL
+if (isTRUE(ADD_DOM_LOCI)) {
+  dom_df <- DOM_LOCI
+  dom_df$Chrom <- factor(dom_df$Chrom, levels = CHRS)
+  dom_df$MidMb <- (dom_df$StartMb + dom_df$EndMb) / 2
+  labs_df <- dom_df
+  labs_df$Xlab <- labs_df$EndMb + LABEL_OFFSET_MB
+  labs_df$Ylab <- 0.98
+}
+
+pal <- brewer.pal(8, "Dark2")
+col_cen  <- pal[4]
+col_seg  <- pal[1]
+col_loci <- pal[4]
+
+message("[per-IL plots] Pop", POP, " IL count: ", length(ILs))
+
+# One plot per WIL
+for (acc in ILs) {
+
+  d <- bins_all[bins_all$Acc == acc & !is.na(bins_all$Chrom), , drop=FALSE]
+  if (!nrow(d)) next
+
+  seg_df <- NULL
+  if (!is.null(segs_all) && nrow(segs_all)) {
+    seg_df <- segs_all[segs_all$Acc == acc & !is.na(segs_all$Chrom), , drop=FALSE]
+    if (nrow(seg_df)) {
+      seg_df$ymin <- SEG_YMIN
+      seg_df$ymax <- SEG_YMAX
+    } else {
+      seg_df <- NULL
+    }
+  }
+
+  p <- ggplot() +
+    (if (!is.null(dom_df) && nrow(dom_df) && isTRUE(SHOW_LOCI_BANDS))
+       geom_rect(
+         data = dom_df,
+         aes(xmin = StartMb, xmax = EndMb, ymin = 0, ymax = 1),
+         inherit.aes = FALSE,
+         fill = col_loci, alpha = 0.10,
+         color = col_loci, linewidth = 0.25
+       ) else NULL) +
+    geom_rect(
+      data = d,
+      aes(xmin = Start/1e6, xmax = End/1e6, ymin = 0, ymax = 1,
+          fill = WE_prop, alpha = alpha_sites),
+      color = NA
+    ) +
+    geom_point(
+      data = d[order(d$Chrom, d$CenterMb), , drop=FALSE],
+      aes(x = CenterMb, y = WE_prop),
+      size = 1.4, stroke = 0, color = "black", alpha = 0.95
+    ) +
+    (if (!is.null(seg_df) && nrow(seg_df))
+       geom_rect(
+         data = seg_df,
+         aes(xmin = Start/1e6, xmax = End/1e6, ymin = ymin, ymax = ymax),
+         inherit.aes = FALSE,
+         fill = NA, color = col_seg, linewidth = 0.7
+       ) else NULL) +
+    (if (!is.null(dom_df) && nrow(dom_df) && isTRUE(SHOW_LOCI_TICKS))
+       geom_vline(
+         data = dom_df,
+         aes(xintercept = MidMb),
+         color = col_loci, linewidth = 0.6, alpha = 0.9
+       ) else NULL) +
+    (if (!is.null(labs_df) && nrow(labs_df) && isTRUE(SHOW_LOCI_LABELS))
+       geom_label(
+         data = labs_df,
+         aes(x = Xlab, y = Ylab, label = Name),
+         inherit.aes = FALSE,
+         size = 3,
+         label.size = 0,
+         fill = "white", alpha = 0.5,
+         hjust = 0, vjust = 1
+       ) else NULL) +
+    geom_vline(
+      data = cen_df,
+      aes(xintercept = CenMb),
+      color = col_cen, linetype = "dashed", linewidth = 0.6, alpha = 0.9
+    ) +
+    facet_wrap(~ Chrom, scales = "free_x", ncol = 3) +
+    scale_fill_gradient(
+      name   = "Donor proportion",
+      limits = c(0, 1),
+      low    = "white",
+      high   = "#7570b3",
+      na.value = "grey90"
+    ) +
+    guides(alpha = "none") +
+    labs(
+      title = paste0("Pop", POP, " - ", acc, " donor proportion"),
+      x = "Position (Mb)",
+      y = "Donor proportion"
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      panel.grid = element_blank(),
+      strip.background = element_rect(fill = "grey90", colour = NA),
+      strip.text = element_text(face = "bold")
+    )
+
+  out_path <- file.path(
+    OUT_DIR,
+    paste0(
+      "Pop", POP, "_IL_", safe_filename(acc), "_", METHOD_TAG,
+      if (isTRUE(ADD_SEGMENTS_OVERLAY)) "_withILsegments" else "",
+      if (isTRUE(ADD_DOM_LOCI)) "_withDomLoci" else "",
+      ".", ifelse(tolower(FILETYPE)=="png","png","pdf")
+    )
+  )
+
+  save_plot(p, out_path)
+}
+
+message("[per-IL plots] wrote to: ", OUT_DIR)
+
+```
+
+
+
+
