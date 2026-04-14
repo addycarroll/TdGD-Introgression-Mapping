@@ -410,3 +410,45 @@
 - OUTPUT: Per-population plots visualizing genomewide divergence between founders, faceted by chromosome
 - Plots per bin nucleotide diveristy results by genomic position, denoting centromere positions on each chromosome facet
 ***
+## PCA using WIL SNPs
+**22. SNPRelate_PCA.Rmd:** Perform PCA investigation across and within TdGD populations
+
+**22.1:**
+- INPUT: Filtered genotype matrices for all populations and within groups of populations based on recurrent parent
+- OUTPUT: GDS files for PCA, both across and within groups of populations
+- Reads filtered genotype matrices, converts to matrix format, and writes the data to GDS files using snpgdsCreateGeno()
+
+**22.2:**
+- INPUT: GDS files from step 22.1
+- OUTPUT: PCA results tables containing sample IDs and the first two PCs
+- PARAMETER MODIFICATION: Change number of PCs extracted as needed
+- Runs PCA with snpgdsPCA() across populations and separately on derived subsets of populations based on recurrent parent, calculating variance explained by each PC
+
+**22.3:**
+- INPUT: PCA results files from step 22.2 with an added column for population labels
+- OUTPUT: PCA plots
+- PARAMETER MODIFICATION: Update population color palettes, shape setting used for groups based on recurrent parent, and plot export dimensions
+- Creates PCA plots, using fill colors for population identity and point shapes for recurrent parent, including precentage of variance explained by PC1 and PC2 on axes
+
+**22.4:**
+- INPUT:
+  - Population-labeled PCA results files from step 22.2
+  - GDS files from step 22.1
+  - Genetic map with SNP.ID and Chromosome columns
+- OUTPUT: SNP correlation with PC1 and PC2 .png plots across all populations, within groups of recurrent parent derived populations, and within each individual population
+- Matches SNP IDs in the GDS files to the external genetic map, assigns chromosomes by subgenome, and calculates SNP correlations with PCs using snpgdsPCACorr(). Plots SNP correlations along the genome, coloring markers by subgenome and labeling chromosomes.
+
+**22.5:**
+- INPUT: Annotated PCA results table, subset to Pop30, with Vrn-A1 allelic state, genome wide donor proportions, and D subgenome donor proportions, by WIL
+- OUTPUT: PCA plots color coded by
+  - Vrn-A1 allelic state
+  - Genome wide donor proportions
+  - D subgenome donor proportions
+- Loads an annotated PCA table for Pop30 and generates targeted PCA overlays to evaluate potential drivers of within-population structure
+
+**22.6:**
+- INPUT: Annotated PCA results table, subset to Pop41 and Pop80, with 2NS presence/absence and donor proportion on chromosome 2A
+- OUTPUT: PCA plots color coded by
+  - Presence/absence of 2NS segment
+  - Chromosome 2A donor proportion
+- Generates targeted PCA overlays to assess whether the structure observed within KS061278M-4-derived populations corresponds to the 2NS translocation or 2A donor proportion
