@@ -1,0 +1,639 @@
+```{r}
+
+##################################
+## Installing and loading packages 
+##################################
+
+# Install SNPRelate and gdsfmt 
+library(devtools)
+if (!requireNamespace("SNPRelate", quietly = TRUE)) {
+  install_github("zhengxwen/gdsfmt")
+  install_github("zhengxwen/SNPRelate")
+}
+
+# Load required packages
+library(SNPRelate)
+library(ggplot2)
+library(viridis)    # For color palettes
+library(dplyr)      # Data manipulation
+library(MASS)       # Matrix operations
+library(corrplot)   # Correlation matrix plot
+library(RColorBrewer)  # Color palettes
+
+```
+
+```{r}
+
+#############################################
+## Prepare genotypic data and create GDS file
+#############################################
+
+## Across all populations
+# Load genotypic matrix from a CSV file
+geno_matrix <- read.csv(
+  "C:/Users/addyhope/OneDrive - Kansas State University/23 TdGD/Analysis/Genotyping/All pops/All pops_filtered.csv", 
+  row.names = 1, 
+  stringsAsFactors = FALSE
+)
+
+# Remove REF and ALT columns
+geno_matrix <- geno_matrix[, !(colnames(geno_matrix) %in% c("REF", "ALT"))]
+
+# Convert the matrix to a proper format
+geno_matrix <- as.matrix(geno_matrix)
+
+# Create GDS file
+snpgdsCreateGeno(
+  gds.fn = "genotype.gds",        # Output GDS file name
+  genmat = geno_matrix,           # Genotypic matrix
+  sample.id = colnames(geno_matrix),  # Sample IDs
+  snp.id = rownames(geno_matrix),     # SNP IDs
+  snpfirstdim = TRUE              # SNPs as rows, individuals as columns
+)
+
+## Within subsets of populations based on recurrent parent
+# Load genotype matrix for KS061406LN.26 populations (Pop30, Pop32, Pop34)
+geno_matrix_LN26 <- read.csv(
+  "C:/Users/addyhope/OneDrive - Kansas State University/23 TdGD/Analysis/Genotyping/All pops/KS061406LN.26 pops_filtered.csv",
+  row.names = 1, 
+  stringsAsFactors = FALSE
+)
+geno_matrix_LN26 <- as.matrix(geno_matrix_LN26)  # Convert to matrix format for further processing
+
+# Create a GDS file for the KS061406LN.26 populations
+snpgdsCreateGeno(
+  gds.fn = "genotype_LN26.gds",  # Output GDS file name
+  genmat = geno_matrix_LN26,     # Input genotypic matrix
+  sample.id = colnames(geno_matrix_LN26),  # Use column names as sample IDs
+  snp.id = rownames(geno_matrix_LN26),    # Use row names as SNP IDs
+  snpfirstdim = TRUE                      # SNPs are rows, individuals are columns
+)
+
+# Load genotype matrix for KS061278M.4 populations (Pop41, Pop42, Pop46, Pop80)
+geno_matrix_M4 <- read.csv(
+  "C:/Users/addyhope/OneDrive - Kansas State University/23 TdGD/Analysis/Genotyping/All pops/KS061278M.4 pops_filtered.csv",
+  row.names = 1, 
+  stringsAsFactors = FALSE
+)
+geno_matrix_M4 <- as.matrix(geno_matrix_M4)  # Convert to matrix format
+
+# Create a GDS file for KS061278M.4 populations
+snpgdsCreateGeno(
+  gds.fn = "genotype_M4.gds",  # Output GDS file
+  genmat = geno_matrix_M4,     # Input genotypic matrix
+  sample.id = colnames(geno_matrix_M4),  # Sample IDs
+  snp.id = rownames(geno_matrix_M4),    # SNP IDs
+  snpfirstdim = TRUE                    # SNPs as rows, individuals as columns
+)
+
+```
+
+```{r}
+
+##############
+## Perform PCA
+##############
+
+## Across populations
+# Open the GDS file
+genofile <- snpgdsOpen("genotype.gds")
+
+# PCA on all SNPs
+pca_result <- snpgdsPCA(genofile, num.thread = 2)
+pc.percent <- pca_result$varprop * 100  # Convert to percentage
+
+# Create a PCA data frame
+pca_data <- data.frame(Sample = pca_result$sample.id, PC1 = pca_result$eigenvect[,1], PC2 = pca_result$eigenvect[,2])
+
+# Save PCA results to a CSV file
+write.csv(pca_data, "PCA_results.csv", row.names = FALSE)
+
+## Within groups of populations based on recurrent parent
+# PCA for KS061406LN.26 populations (Pop30, Pop32, Pop34)
+genofile_LN26 <- snpgdsOpen("genotype_LN26.gds")  # Open the GDS file 
+pca_result_LN26 <- snpgdsPCA(genofile_LN26, num.thread = 2)  # Perform PCA
+
+# Calculate variance explained by each principal component
+pc.percent_LN26 <- pca_result_LN26$varprop * 100  # Convert variance to percentage
+
+# Create a data frame for PCA results (first two principal components)
+pca_data_LN26 <- data.frame(
+  Sample = pca_result_LN26$sample.id,  # Sample IDs
+  PC1 = pca_result_LN26$eigenvect[, 1],  # PC1
+  PC2 = pca_result_LN26$eigenvect[, 2]   # PC2
+)
+write.csv(pca_data_LN26, "PCA_results_LN26.csv", row.names = FALSE)  # Save PCA results
+
+# PCA for KS061278M.4 populations (Pop41, Pop42, Pop46, Pop80)
+genofile_M4 <- snpgdsOpen("genotype_M4.gds")  # Open the GDS file
+pca_result_M4 <- snpgdsPCA(genofile_M4, num.thread = 2)  # Perform PCA
+
+# Calculate variance explained by each principal component
+pc.percent_M4 <- pca_result_M4$varprop * 100
+
+# Create a data frame for PCA results
+pca_data_M4 <- data.frame(
+  Sample = pca_result_M4$sample.id,  # Sample IDs
+  PC1 = pca_result_M4$eigenvect[, 1],  # PC1
+  PC2 = pca_result_M4$eigenvect[, 2]   # PC2
+)
+write.csv(pca_data_M4, "PCA_results_M4.csv", row.names = FALSE)  # Save results
+
+```
+
+```{r}
+
+####################################
+## Load PCA data and create PC plots
+####################################
+
+## Across populations
+# Load population-labeled PCA results
+pca_data <- read.csv("PCA_results_population_labels.csv", stringsAsFactors = FALSE)
+
+# Define custom population colors
+population_colors <- c(
+  "Pop30" = "#a6761d", "Pop32" = "#1b9e77", "Pop34" = "#d95f02",
+  "Pop41" = "#7570b3", "Pop42" = "#e7298a", "Pop46" = "#66a61e", "Pop80" = "#e6ab02"
+)
+
+# Define shapes based on recurrent parent
+parent_shapes <- c("KS061406LN~26" = 21, "KS061278M-4" = 24)
+
+# Create PCA plot with color-coded populations and black outlines using shapes for parents
+ggplot(pca_data, aes(x = PC1, y = PC2, fill = Population, shape = Recurrent.Parent)) +
+  geom_point(size = 2.5, alpha = 0.8, color = "black", stroke = 0.3) +
+  scale_fill_manual(values = population_colors) +
+  scale_shape_manual(values = parent_shapes) +
+  labs(
+    title = "PCA across 7 TdGD Populations",
+    x = paste0("PC1 (", round(pc.percent[1], 1), "%)"),
+    y = paste0("PC2 (", round(pc.percent[2], 1), "%)"),
+    shape = "Recurrent Parent"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  guides(fill = guide_legend(override.aes = list(shape = 21)))
+
+# Save the PCA plot to a PNG file
+ggsave("PCA_combined.png", width = 8, height = 6, bg = "white")
+
+## Within groups of populations based on recurrent parent
+# Load PCA results for KS061406LN.26 populations (Pop30, Pop32, Pop34)
+pca_data_LN26 <- read.csv("PCA_results_LN26_population_labels.csv", stringsAsFactors = FALSE)
+
+# Define custom colors for the populations
+population_colors_LN26 <- c(
+  "Pop30" = "#a6761d",
+  "Pop32" = "#1b9e77",
+  "Pop34" = "#d95f02"
+)
+
+# Create the PCA plot for KS061406LN~26 populations
+pca_plot_LN26 <- ggplot(
+  pca_data_LN26,
+  aes(x = PC1, y = PC2, fill = Population)
+) +
+  geom_point(
+    shape = 21,
+    size = 2.5,
+    alpha = 0.8,
+    color = "black",
+    stroke = 0.4
+  ) +
+  scale_fill_manual(values = population_colors_LN26) +
+  labs(
+    title = "PCA for KS061406LN~26 Populations",
+    x = paste0("PC1 (", round(pc.percent_LN26[1], 1), "%)"),
+    y = paste0("PC2 (", round(pc.percent_LN26[2], 1), "%)")
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+# Save the plot as a PNG file
+ggsave("PCA_plot_LN26.png", plot = pca_plot_LN26, width = 8, height = 6, bg = "white")
+
+# Load PCA results for KS061278M.4 populations (Pop41, Pop42, Pop46, Pop80)
+pca_data_M4 <- read.csv("PCA_results_M4_population_labels.csv", stringsAsFactors = FALSE)
+
+# Define custom colors for the populations
+population_colors_M4 <- c(
+  "Pop41" = "#7570b3",
+  "Pop42" = "#e7298a",
+  "Pop46" = "#66a61e",
+  "Pop80" = "#e6ab02"
+)
+
+# Create the PCA plot for KS061278M-4 populations
+pca_plot_M4 <- ggplot(
+  pca_data_M4,
+  aes(x = PC1, y = PC2, fill = Population)
+) +
+  geom_point(
+    shape = 21,
+    size = 2.5,
+    alpha = 0.8,
+    color = "black",
+    stroke = 0.4
+  ) +
+  scale_fill_manual(values = population_colors_M4) +
+  labs(
+    title = "PCA for KS061278M-4 Populations",
+    x = paste0("PC1 (", round(pc.percent_M4[1], 1), "%)"),
+    y = paste0("PC2 (", round(pc.percent_M4[2], 1), "%)")
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+# Save the plot as a PNG file
+ggsave("PCA_plot_M4.png", plot = pca_plot_M4, width = 8, height = 6, bg = "white")
+
+```
+
+```{r}
+
+########################
+## SNP correlation plots
+########################
+
+## Across populations
+# Read the genetic map file
+gm <- read.csv("C:/Users/addyhope/OneDrive - Kansas State University/23 TdGD/Analysis/Genotyping/PCA/Genetic map.csv", stringsAsFactors = FALSE)
+
+# Extract SNP IDs from the GDS file to ensure alignment
+snp_ids <- read.gdsn(index.gdsn(genofile, "snp.id"))
+
+# Match the genetic map to the SNP IDs in the GDS file
+gm <- gm[match(snp_ids, gm$SNP.ID), ]
+
+# Check for missing chromosome entries in the genetic map
+chr <- gm$Chromosome
+if (any(is.na(chr))) {
+  stop("Some SNPs are not matched with the genetic map.")
+}
+
+# Split chromosomes into groups A, B, and D based on their names
+chr_group <- gsub("\\d", "", chr)  # Extract A/B/D group from chromosome name
+
+# Assign different colors to A, B, D using viridis magma palette
+group_A_colors <- "#7570b3"
+group_B_colors <- "#1b9e77"
+group_D_colors <- "#d95f02"
+
+# Assign colors to each SNP based on chromosome group
+colors_for_chr <- sapply(chr_group, function(group) {
+  if (group == "A") return(group_A_colors)
+  if (group == "B") return(group_B_colors)
+  if (group == "D") return(group_D_colors)
+})
+
+# Calculate SNP correlations with PC1 and PC2
+CORR <- snpgdsPCACorr(pca_result, genofile, eig.which = 1:4)
+
+# Get chromosome boundaries for plotting
+chr_boundaries <- cumsum(table(chr))
+
+# Calculate midpoints of chromosomes for labeling purposes
+chr_midpoints <- (c(0, chr_boundaries[-length(chr_boundaries)]) + chr_boundaries) / 2
+chr_labels <- unique(chr)  # Chromosome names
+
+# Plot SNP correlation with principal components
+png("SNP_correlation_plots.png", width = 800, height = 600)
+
+# Adjust the plot layout and margins
+par(mfrow = c(2, 1), mai = c(1, 0.8, 0.6, 0.5))  # Adjust bottom margin for x-axis labels
+
+# Loop over the first two principal components to plot SNP correlations
+for (i in 1:2) {
+  # Plot absolute SNP correlations with PC1 and PC2, using chromosome colors
+  plot(abs(CORR$snpcorr[i, ]), ylim = c(0, 1), xlab = "Chromosome", 
+       ylab = "Correlation", col = colors_for_chr, pch = "+", xaxt = "n")
+  
+  # Add chromosome labels at the calculated midpoints
+  axis(1, at = chr_midpoints, labels = chr_labels, tick = FALSE, las = 1, cex.axis = 0.8)
+  
+  # Add titles to the plot for each PC
+  title(main = paste("SNP Correlation with Principal Component", i), line = 1.5, cex.main = 1.2)
+}
+
+# Save the plot and close the PNG device
+dev.off()
+
+
+## Within groups of populations based on recurrent parent and within each population
+
+gds_LN26   <- "genotype_LN26.gds"
+gds_M4     <- "genotype_M4.gds"
+labels_csv <- "PCA_results_population_labels.csv"   # must have Sample, Population
+gm_csv     <- "Genetic map.csv"                     # must have SNP.ID, Chromosome
+
+out_dir <- "SNP_PCcorr_plots"
+dir.create(out_dir, showWarnings = FALSE)
+
+# Read labels and genetic map
+lab <- read.csv(labels_csv, stringsAsFactors = FALSE)
+stopifnot(all(c("Sample", "Population") %in% names(lab)))
+lab$Sample <- trimws(lab$Sample)
+lab$Population <- trimws(lab$Population)
+
+gm <- read.csv(gm_csv, stringsAsFactors = FALSE)
+stopifnot(all(c("SNP.ID", "Chromosome") %in% names(gm)))
+gm$SNP.ID <- trimws(gm$SNP.ID)
+gm$Chromosome <- trimws(gm$Chromosome)
+
+# Define RP groups
+LN26_pops <- c("Pop30", "Pop32", "Pop34")
+M4_pops   <- c("Pop41", "Pop42", "Pop46", "Pop80")
+
+# Helper function
+plot_snp_pcorr_old <- function(genofile, gm, title_prefix, out_png,
+                               sample_ids = NULL,
+                               pcs_to_plot = 1:2,
+                               num_thread = 2) {
+
+  gds_samples <- read.gdsn(index.gdsn(genofile, "sample.id"))
+  if (!is.null(sample_ids)) {
+    sample_ids <- intersect(sample_ids, gds_samples)
+    if (length(sample_ids) < 3) stop("Too few samples for: ", title_prefix)
+  }
+
+  # PCA
+  pca <- snpgdsPCA(genofile, sample.id = sample_ids, num.thread = num_thread)
+
+  # Correlations
+  corr <- snpgdsPCACorr(pca, genofile, eig.which = pcs_to_plot)
+
+  snp_ids <- read.gdsn(index.gdsn(genofile, "snp.id"))
+  snp_ids <- as.character(snp_ids)
+
+  # Map SNP -> Chromosome
+  gm_sub <- gm[match(snp_ids, gm$SNP.ID), , drop = FALSE]
+  chr <- gm_sub$Chromosome
+  if (any(is.na(chr))) {
+    bad <- snp_ids[is.na(chr)]
+    stop("Genetic map missing Chromosome for some SNPs in: ", title_prefix,
+         "\nExample missing SNP IDs: ", paste(head(bad, 10), collapse = ", "))
+  }
+
+  # Color by subgenome (A/B/D)
+  chr_group <- gsub("\\d", "", chr)
+  group_A_color <- "#7570b3"
+  group_B_color <- "#1b9e77"
+  group_D_color <- "#d95f02"
+  colors_for_chr <- ifelse(chr_group == "A", group_A_color,
+                    ifelse(chr_group == "B", group_B_color, group_D_color))
+
+  # Chromosome boundaries/midpoints
+  chr_boundaries <- cumsum(table(chr))
+  chr_midpoints  <- (c(0, chr_boundaries[-length(chr_boundaries)]) + chr_boundaries) / 2
+  chr_labels     <- unique(chr)
+
+  # Corr columns should match SNP count
+  if (ncol(corr$snpcorr) != length(snp_ids)) {
+    stop("Mismatch: corr has ", ncol(corr$snpcorr),
+         " SNPs but GDS has ", length(snp_ids),
+         " for: ", title_prefix,
+         "\n(This usually means PCACorr did not run on all SNPs somehow.)")
+  }
+
+  # Plot
+  png(out_png, width = 900, height = 650)
+  par(mfrow = c(length(pcs_to_plot), 1), mai = c(1, 0.8, 0.8, 0.3))
+
+  for (k in seq_along(pcs_to_plot)) {
+    pc_i <- pcs_to_plot[k]
+    y <- abs(corr$snpcorr[k, ])
+
+    plot(y,
+         ylim = c(0, 1),
+         xlab = "Chromosome",
+         ylab = "Correlation",
+         col = colors_for_chr,
+         pch = "+",
+         xaxt = "n")
+
+    axis(1, at = chr_midpoints, labels = chr_labels, tick = FALSE, las = 1, cex.axis = 0.8)
+
+    title(main = paste0(title_prefix, ": SNP correlation with PC", pc_i),
+          line = 1.5, cex.main = 1.1)
+  }
+
+  dev.off()
+}
+
+# Group plots
+# LN26 group (Pop30/32/34)
+plot_snp_pcorr_old(
+  genofile     = genofile_LN26,
+  gm           = gm,
+  title_prefix = "LN26 group (Pop30/32/34)",
+  out_png      = file.path(out_dir, "SNP_correlation_LN26_group_PC1_PC2.png"),
+  sample_ids   = NULL,
+  pcs_to_plot  = 1:2,
+  num_thread   = 2
+)
+
+# M4 group (Pop41/42/46/80)
+plot_snp_pcorr_old(
+  genofile     = genofile_M4,
+  gm           = gm,
+  title_prefix = "M-4 group (Pop41/42/46/80)",
+  out_png      = file.path(out_dir, "SNP_correlation_M4_group_PC1_PC2.png"),
+  sample_ids   = NULL,
+  pcs_to_plot  = 1:2,
+  num_thread   = 2
+)
+
+# Per-population plots
+for (pop in LN26_pops) {
+  pop_ids <- lab$Sample[lab$Population == pop]
+  plot_snp_pcorr_old(
+    genofile     = genofile_LN26,
+    gm           = gm,
+    title_prefix = pop,
+    out_png      = file.path(out_dir, paste0("SNP_correlation_", pop, "_PC1_PC2.png")),
+    sample_ids   = pop_ids,
+    pcs_to_plot  = 1:2,
+    num_thread   = 2
+  )
+}
+
+for (pop in M4_pops) {
+  pop_ids <- lab$Sample[lab$Population == pop]
+  plot_snp_pcorr_old(
+    genofile     = genofile_M4,
+    gm           = gm,
+    title_prefix = pop,
+    out_png      = file.path(out_dir, paste0("SNP_correlation_", pop, "_PC1_PC2.png")),
+    sample_ids   = pop_ids,
+    pcs_to_plot  = 1:2,
+    num_thread   = 2
+  )
+}
+
+# Close
+snpgdsClose(genofile_LN26)
+snpgdsClose(genofile_M4)
+
+cat("Done. Plots written to: ", normalizePath(out_dir), "\n")
+
+```
+
+```{r}
+
+########################################
+## Investigation of structuring in Pop30
+########################################
+
+# Vrn
+
+pca <- read.csv("C:/Users/addyhope/OneDrive - Kansas State University/23 TdGD/Analysis/Genotyping/PCA/Vrn_Rht_Pop30/Pop30_Vrn_Rht.csv", stringsAsFactors = FALSE)
+
+pca$Vrn.A1 <- factor(pca$`Vrn.A1`, levels = c(0, 1, 2))
+
+vrn_cols <- c(
+  "0" = "#1b9e77",
+  "2" = "#d95f02",
+  "1" = "#7570b3"
+)
+
+pca <- pca |>
+  subset(!is.na(Vrn.A1) & !is.na(PC1) & !is.na(PC2))
+
+
+p_vrn <- ggplot(pca, aes(x = PC1, y = PC2, fill = Vrn.A1)) +
+  geom_point(shape = 21, size = 2.5, alpha = 0.8, color = "black", stroke = 0.4, na.rm = TRUE) +
+  scale_fill_manual(values = vrn_cols, name = "Vrn-A1") +
+  labs(
+    title = "PCA (colored by Vrn-A1)",
+    x = "PC1",
+    y = "PC2"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+p_vrn
+
+ggsave("PCA_plot_Pop30_Vrn.A1.png", plot = p_vrn, width = 8, height = 6, bg = "white")
+
+# D genome donor proportion
+
+p_donD <- ggplot(pca, aes(x = PC1, y = PC2, fill = DonorPropD)) +
+  geom_point(shape = 21, size = 2.5, alpha = 0.8, color = "black", stroke = 0.4) +
+  scale_fill_distiller(
+    palette = "YlOrBr",
+    direction = 1,
+    name = "DonorProp (D)"
+  ) +
+  labs(
+    title = "PCA (colored by donor proportion)",
+    x = "PC1",
+    y = "PC2"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+# Genome wide donor proportion
+
+p_don <- ggplot(pca, aes(x = PC1, y = PC2, fill = DonorProp)) +
+  geom_point(shape = 21, size = 2.5, alpha = 0.8, color = "black", stroke = 0.4) +
+  scale_fill_distiller(
+    palette = "YlOrBr",
+    direction = 1,
+    name = "DonorProp"
+  ) +
+  labs(
+    title = "PCA (colored by donor proportion)",
+    x = "PC1",
+    y = "PC2"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+p_donD
+p_don
+
+ggsave("PCA_plot_Pop30_DonorPropD.png", plot = p_donD, width = 8, height = 6, bg = "white")
+ggsave("PCA_plot_Pop30_DonorProp.png", plot = p_don, width = 8, height = 6, bg = "white")
+
+```
+
+```{r}
+
+########################################################################
+## Investigation of population structuring correlated with chromosome 2A
+########################################################################
+
+# 2NS
+
+pca <- read.csv("C:/Users/addyhope/OneDrive - Kansas State University/23 TdGD/Analysis/Genotyping/PCA/2NS_Pop80/PCA_results_M4_investigate.csv", stringsAsFactors = FALSE)
+
+pca <- subset(pca, !is.na(X2NS) & X2NS !="")
+
+X2NS_cols <- c(
+  "2NS" = "#1b9e77",
+  "non 2NS" = "#d95f02",
+  "Het" = "#7570b3"
+)
+
+p_2NS <- ggplot(pca, aes(x = PC1, y = PC2, fill = X2NS)) +
+  geom_point(shape = 21, size = 2.5, alpha = 0.8, color = "black", stroke = 0.4) +
+  scale_fill_manual(values = X2NS_cols, name = "2NS") +
+  labs(
+    title = "PCA (colored by 2NS)",
+    x = "PC1",
+    y = "PC2"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+p_2NS
+
+# 2A donor proportions
+
+p_donprop <- ggplot(pca, aes(x = PC1, y = PC2, fill = DonorProp_2A)) +
+  geom_point(shape = 21, size = 2.5, alpha = 0.8, color = "black", stroke = 0.4) +
+  scale_fill_distiller(
+    palette = "YlOrBr",
+    direction = 1,
+    name = "DonorProp (2A)"
+  ) +
+  labs(
+    title = "PCA (colored by donor proportions)",
+    x = "PC1",
+    y = "PC2"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+p_donprop
+
+```
+
