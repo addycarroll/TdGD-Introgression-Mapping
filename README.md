@@ -478,3 +478,45 @@
   - BWA index files for the combined reference
 - Appends the renamed Weining chromosome 1R sequence to the complete Jagger assembly, validates the combined reference for expected sequence counts, chromosome lengths, and unique sequence IDs, and generates SAMtools and BWA indices
 
+**23c. align_larry_rp_to_jagger_1R.sh:** Align Larry and KS061278M-4 reads to the competitive Jagger plus Weining chromosome 1R reference
+- INPUT:
+  - Combined and indexed Jagger plus Weining chromosome 1R reference generated in step 23b
+  - Paired-end Larry FASTQ files generated in step 23a
+  - Paired-end KS061278M-4 FASTQ files
+- OUTPUT: For each sample...
+  - Coordinate-sorted BAM file containing mapped reads
+  - CSI index for the BAM file
+  - BWA-MEM alignment log
+  - SAMtools alignment statistics and flag statistics
+  - Whole-chromosome coverage summaries for Jagger chromosome 1B and Weining chromosome 1R
+  - Run-information file recording software versions, input paths, thread settings, and alignment-filtering decisions
+- Validates the reference, BWA index files, FASTQ inputs, and expected lengths of Jagger chromosome 1B and Weining chromosome 1R before alignment; uses BWA-MEM to align each sample to the same competitive reference and SAMtools to retain mapped reads, coordinate-sort the alignments, validate and index the BAM file, and generate alignment and chromosome-level coverage summaries
+
+**23d. align_RP2_emmer_jagger_1R.sh:** Align KS061406LN~26 and seven wild-emmer donors to the competitive Jagger plus Weining chromosome 1R reference
+- INPUT:
+  - Combined and indexed Jagger plus Weining chromosome 1R reference generated in step 23b
+  - Paired-end FASTQ files for KS061406LN~26 and the seven wild-emmer donors
+  - Embedded sample manifest specifying sample names, sequencing data types, and corresponding FASTQ run prefixes
+- OUTPUT: For each sample...
+  - Coordinate-sorted BAM files for each sequencing run
+  - CSI index for the final BAM file
+  - BWA-MEM alignment logs for individual runs
+  - SAMtools alignment statistics and flag statistics
+  - Whole-chromosome coverage summaries for Jagger chromosome 1B and Weining chromosome 1R
+  - Run-information file recording sample metadata, input runs, software versions, and alignment-filtering decisions
+- Processes KS061406LN~26 and the seven wild-emmer donors as an eight-task SLURM array, validates the competitive reference and expected Jagger chromosome 1B and Weining chromosome 1R records before alignment
+- Aligns each sequencing run separately using BWA-MEM, retains mapped reads, coordinate-sorts the alignments, and merges multiple runs belonging to the same biological sample, uses SAMtools to validate, merge, index, and summarize the alignments and to generate chromosome-level coverage statistics
+
+**23e. make_1B1R_coverage_plots.sh:** Calculate and plot read-depth coverage across Jagger chromosome 1B and Weining chromosome 1R
+- INPUT: Coordinate-sorted and CSI-indexed BAM files for Larry, KS061278M-4, KS061406LN~26, and the seven wild-emmer donors generated in steps 23c and 23d
+- OUTPUT:
+  - BED file dividing Jagger chromosome 1B and Weining chromosome 1R into consecutive, nonoverlapping bins
+  - Per-sample and per-MAPQ-threshold coverage tables reporting bin coordinates, exact bin lengths, depth sums, overlapping read counts, and mean read depth
+  - Combined coverage table containing data for all samples
+  - Separate PNG coverage plot for each sample and MAPQ threshold, with Jagger chromosome 1B and Weining chromosome 1R displayed side by side
+  - Run-information file recording software versions, bin size, MAPQ thresholds, coverage calculation, plotting parameters, and output locations
+- PARAMETER MODIFICATION:
+  - Bin size (set to 1 Mb)
+  - Minimum mapping-quality thresholds used to calculate coverage
+  - Maximum displayed y-axis value specified separately for each sample
+- Generates and validates consecutive bins spanning the complete lengths of Jagger chromosome 1B and Weining chromosome 1R, uses SAMtools bedcov to calculate the aligned-base depth sum and number of alignments overlapping each bin after applying the specified mapping-quality threshold, calculates raw mean read depth as the depth sum divided by the exact bin length, combines coverage results across samples and produces dot plots showing the chromosome-wide raw-depth profiles
