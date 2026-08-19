@@ -452,3 +452,29 @@
   - Presence/absence of 2NS segment
   - Chromosome 2A donor proportion
 - Generates targeted PCA overlays to assess whether the structure observed within KS061278M-4-derived populations corresponds to the 2NS translocation or 2A donor proportion
+***
+## 1B1R coverage analysis
+**23a. download_jagger_rye_larry.sh:** Download reference assemblies and positive control sequencing data for 1RS.1BL coverage analysis
+- INPUT:
+  - NCBI accession for the complete Jagger wheat assembly (GCA_903993795.1)
+  - NCBI accession for the complete Weining rye assembly (GCA_016097815.1)
+  - NCBI SRA run for Larry, a positive control carrying the 1RS.1BL translocation (SRR13572423)
+- OUTPUT:
+  - Complete Jagger wheat reference genome and corresponding assembly report
+  - Jagger chromosome 1B FASTA extracted for inspection
+  - Complete Weining rye reference genome and corresponding assembly report
+  - Weining rye chromosome 1R FASTA extracted for construction of the competitive-alignment reference
+  - Validated Larry SRA data
+  - Compressed paired-end Larry FASTQ files
+- Downloads the complete Jagger and Weining assemblies and their assembly reports from NCBI (Wget and standard Unix tools), identifies and extracts chromosome 1B and chromosome 1R using the chromosome accessions recorded in the assembly reports, downloads and validates the Larry SRA run (SRA Toolkit), and converts the run to compressed paired-end FASTQ files (pigz)
+
+**23b. build_jagger_weining1R_ref.sh:** Build and index a Jagger wheat plus Weining rye chromosome 1R reference
+- INPUT:
+  - Complete Jagger wheat reference genome and assembly report downloaded in step 23a
+  - Extracted Weining rye chromosome 1R FASTA and complete Weining assembly report downloaded in step 23a
+- OUTPUT:
+  - Combined reference FASTA containing the complete Jagger wheat assembly plus Weining rye chromosome 1R
+  - FASTA index (.fai) generated for the combined reference
+  - BWA index files for the combined reference
+- Appends the renamed Weining chromosome 1R sequence to the complete Jagger assembly, validates the combined reference for expected sequence counts, chromosome lengths, and unique sequence IDs, and generates SAMtools and BWA indices
+
